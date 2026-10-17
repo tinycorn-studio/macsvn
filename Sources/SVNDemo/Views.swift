@@ -2,19 +2,31 @@ import SwiftUI
 import AppKit
 
 enum ForkTheme {
-    static let bg = Color(red: 0.121, green: 0.125, blue: 0.137)
-    static let panel = Color(red: 0.145, green: 0.149, blue: 0.165)
-    static let sidebar = Color(red: 0.106, green: 0.110, blue: 0.122)
-    static let rowSelected = Color(red: 0.223, green: 0.333, blue: 0.588)
-    static let accent = Color(red: 0.357, green: 0.565, blue: 1.0)
-    static let textPrimary = Color(white: 0.93)
-    static let textSecondary = Color(white: 0.58)
-    static let addBG = Color(red: 0.129, green: 0.286, blue: 0.176)
-    static let addText = Color(red: 0.588, green: 0.878, blue: 0.639)
-    static let delBG = Color(red: 0.337, green: 0.149, blue: 0.161)
-    static let delText = Color(red: 0.941, green: 0.588, blue: 0.596)
-    static let hunkText = Color(red: 0.573, green: 0.478, blue: 0.965)
-    static let border = Color(white: 0.24)
+    private static func dyn(_ dark: NSColor, _ light: NSColor) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return isDark ? dark : light
+        })
+    }
+
+    private static func c(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> NSColor {
+        NSColor(calibratedRed: r, green: g, blue: b, alpha: 1)
+    }
+
+    static let bg = dyn(c(0.121, 0.125, 0.137), c(0.965, 0.965, 0.973))
+    static let panel = dyn(c(0.145, 0.149, 0.165), c(0.937, 0.937, 0.945))
+    static let sidebar = dyn(c(0.106, 0.110, 0.122), c(0.918, 0.918, 0.929))
+    static let rowSelected = dyn(c(0.223, 0.333, 0.588), c(0.251, 0.451, 0.902))
+    static let accent = dyn(c(0.357, 0.565, 1.0), c(0.196, 0.416, 0.929))
+    static let textPrimary = dyn(c(0.93, 0.93, 0.93), c(0.13, 0.13, 0.14))
+    static let textSecondary = dyn(c(0.58, 0.58, 0.58), c(0.44, 0.44, 0.47))
+    static let addBG = dyn(c(0.129, 0.286, 0.176), c(0.851, 0.957, 0.874))
+    static let addText = dyn(c(0.588, 0.878, 0.639), c(0.086, 0.435, 0.196))
+    static let delBG = dyn(c(0.337, 0.149, 0.161), c(0.988, 0.878, 0.886))
+    static let delText = dyn(c(0.941, 0.588, 0.596), c(0.717, 0.145, 0.180))
+    static let hunkText = dyn(c(0.573, 0.478, 0.965), c(0.416, 0.278, 0.851))
+    static let border = dyn(c(0.24, 0.24, 0.24), c(0.796, 0.796, 0.827))
+    static let buttonTint = dyn(c(0.30, 0.30, 0.32), c(0.855, 0.855, 0.878))
 }
 
 struct ContentView: View {
@@ -31,6 +43,9 @@ struct ContentView: View {
     @State private var showUpdate = false
     @State private var toast: String?
     @State private var draftMessage = ""
+    @State private var isRefreshing = false
+    @State private var appError: String?
+    @AppStorage("backupBeforeRevert") private var backupBeforeRevert = true
 
     private var activeWC: WorkingCopy {
         workingCopies.first { $0.id == selectedWCID } ?? workingCopies[0]
@@ -85,11 +100,14 @@ struct ContentView: View {
             commitBar
         }
         .background(ForkTheme.bg)
-        .preferredColorScheme(.dark)
         .sheet(isPresented: $showCommit) {
             CommitSheet(wc: activeWC, files: $files, draftMessage: $draftMessage) { count in
                 showToast("Committed \(count) file(s) at r\(activeWC.revision + 1)")
                 bumpRevision()
+                let conflicts = files.filter { $0.status == .conflicted }.count
+                if conflicts > 0 {
+                    showError("svn: E155015: commit partially succeeded - \(conflicts) conflicted file(s) were skipped. Resolve conflicts before the next commit.")
+                }
             }
         }
         .sheet(isPresented: $showCheckout) {
@@ -109,7 +127,7 @@ struct ContentView: View {
             Button("Revert", role: .destructive) { performRevert() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("All local modifications will be permanently lost (discard changes). This cannot be undone.")
+            Text(revertAlertMessage)
         }
         .overlay(alignment: .bottom) {
             if let toast {
@@ -118,7 +136,7 @@ struct ContentView: View {
                     .foregroundStyle(ForkTheme.textPrimary)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
-                    .background(Color(white: 0.22), in: Capsule())
+                    .background(ForkTheme.panel, in: Capsule())
                     .overlay(Capsule().stroke(ForkTheme.border))
                     .padding(.bottom, 92)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -127,6 +145,7 @@ struct ContentView: View {
         .onAppear {
             if selectedWCID == nil { selectedWCID = workingCopies.first?.id }
         }
+        .onChange(of: selectedWCID) { refreshStatus() }
         .frame(minWidth: 760, minHeight: 560)
     }
 
@@ -170,7 +189,7 @@ struct ContentView: View {
             toolbarIcon("square.and.arrow.down", "Checkout...") { showCheckout = true }
             toolbarIcon("arrow.uturn.backward", "Revert - discard changes...") { showRevertConfirm = true }
                 .disabled(checkedFiles.isEmpty)
-            toolbarIcon("arrow.clockwise", "Refresh status") { showToast("Status refreshed") }
+            toolbarIcon("arrow.clockwise", "Refresh status") { refreshStatus() }
                 .keyboardShortcut("r", modifiers: .command)
 
             Button {
@@ -180,7 +199,27 @@ struct ContentView: View {
                     .font(.system(size: 12, weight: .medium))
             }
             .buttonStyle(.borderedProminent)
-            .tint(Color(white: 0.30))
+            .tint(ForkTheme.buttonTint)
+            .foregroundStyle(ForkTheme.textPrimary)
+
+            Menu {
+                Toggle("Backup files before Revert", isOn: $backupBeforeRevert)
+                Divider()
+                Button("Preview error banner") {
+                    showError("svn: E170001: Authentication failed for 'http://svn.example.com/repos/example/ExampleApp' - check username/password and try again.")
+                }
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(ForkTheme.textPrimary)
+                    .frame(width: 28, height: 24)
+                    .background(ForkTheme.panel, in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Settings & demo options")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
@@ -307,15 +346,53 @@ struct ContentView: View {
             .padding(.horizontal, 10)
             .padding(.bottom, 8)
 
+            if let appError {
+                errorBanner(appError)
+            }
+
             hr
 
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(visibleFiles) { item in
-                        changeRow(item)
+            ZStack {
+                if visibleFiles.isEmpty {
+                    emptyStateView
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(visibleFiles) { item in
+                                changeRow(item)
+                            }
+                        }
+                        .padding(.vertical, 4)
                     }
+                    .focusable()
+                    .focusEffectDisabled()
+                    .onKeyPress(.downArrow) {
+                        moveFocus(1)
+                        return .handled
+                    }
+                    .onKeyPress(.upArrow) {
+                        moveFocus(-1)
+                        return .handled
+                    }
+                    .onKeyPress(.space) {
+                        toggleFocused()
+                        return .handled
+                    }
+                    .help("Keys: up/down navigate, Space toggle, Cmd+Return commit")
                 }
-                .padding(.vertical, 4)
+
+                if isRefreshing {
+                    VStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Checking for modifications...")
+                            .font(.system(size: 11))
+                            .foregroundStyle(ForkTheme.textSecondary)
+                    }
+                    .padding(16)
+                    .background(ForkTheme.panel.opacity(0.92), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(ForkTheme.border))
+                }
             }
 
             hr
@@ -584,6 +661,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .tint(ForkTheme.accent)
+                .keyboardShortcut(.return, modifiers: .command)
                 .disabled(checkedFiles.isEmpty)
 
                 Text("\(checkedFiles.count) of \(files.filter { $0.status.isChanged }.count) selected")
@@ -612,7 +690,9 @@ struct ContentView: View {
                 files[idx].isChecked = false
             }
         }
-        showToast("Reverted \(checked.count) file(s)")
+        showToast(backupBeforeRevert
+                  ? "Reverted \(checked.count) file(s) - backup saved to ~/.MacSVN/trash"
+                  : "Reverted \(checked.count) file(s)")
     }
 
     private func ignore(_ item: FileItem, mode: IgnoreMode) {
@@ -634,6 +714,94 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
             withAnimation { toast = nil }
         }
+    }
+
+    private func showError(_ message: String) {
+        withAnimation { appError = message }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+            if appError == message {
+                withAnimation { appError = nil }
+            }
+        }
+    }
+
+    private func refreshStatus() {
+        guard !isRefreshing else { return }
+        withAnimation { isRefreshing = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            withAnimation { isRefreshing = false }
+            showToast("Status refreshed")
+        }
+    }
+
+    private func moveFocus(_ delta: Int) {
+        guard !visibleFiles.isEmpty else { return }
+        let current = visibleFiles.firstIndex { $0.id == focusedFile?.id } ?? -1
+        let next = max(0, min(visibleFiles.count - 1, current + delta))
+        selectedFileID = visibleFiles[next].id
+    }
+
+    private func toggleFocused() {
+        guard let item = focusedFile,
+              let idx = files.firstIndex(where: { $0.id == item.id }) else { return }
+        files[idx].isChecked.toggle()
+    }
+
+    private var emptyStateView: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "checkmark.seal")
+                .font(.system(size: 26))
+                .foregroundStyle(ForkTheme.textSecondary)
+            Text(files.contains { $0.status.isChanged }
+                 ? "No files match the current filter"
+                 : "Working copy is clean - no changes")
+                .font(.system(size: 12))
+                .foregroundStyle(ForkTheme.textSecondary)
+            if !search.isEmpty || filter != .all {
+                Button("Clear filter") {
+                    search = ""
+                    filter = .all
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11))
+                .foregroundStyle(ForkTheme.accent)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(20)
+    }
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(.red)
+            Text(message)
+                .font(.system(size: 11))
+                .foregroundStyle(ForkTheme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button {
+                withAnimation { appError = nil }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(ForkTheme.textSecondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(10)
+        .background(Color.red.opacity(0.14))
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.red.opacity(0.35)).frame(height: 1)
+        }
+    }
+
+    private var revertAlertMessage: String {
+        if backupBeforeRevert {
+            return "Local changes will be discarded. A backup copy of each file will be saved to ~/.MacSVN/trash so you can restore manually if needed."
+        }
+        return "All local modifications will be permanently lost (discard changes). This cannot be undone."
     }
 }
 
@@ -777,7 +945,6 @@ struct CommitSheet: View {
         .padding(18)
         .frame(width: 640)
         .background(ForkTheme.sidebar)
-        .preferredColorScheme(.dark)
         .onAppear { message = draftMessage }
     }
 
@@ -889,7 +1056,6 @@ struct CheckoutSheet: View {
         .padding(18)
         .frame(width: 620)
         .background(ForkTheme.sidebar)
-        .preferredColorScheme(.dark)
     }
 }
 
@@ -948,7 +1114,6 @@ struct UpdateProgressSheet: View {
         .padding(18)
         .frame(width: 560)
         .background(ForkTheme.sidebar)
-        .preferredColorScheme(.dark)
         .task {
             for step in steps {
                 try? await Task.sleep(nanoseconds: 300_000_000)
