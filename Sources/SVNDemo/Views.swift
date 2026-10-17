@@ -21,10 +21,10 @@ enum ForkTheme {
     static let accent = dyn(c(0.357, 0.565, 1.0), c(0.196, 0.416, 0.929))
     static let textPrimary = dyn(c(0.93, 0.93, 0.93), c(0.13, 0.13, 0.14))
     static let textSecondary = dyn(c(0.58, 0.58, 0.58), c(0.44, 0.44, 0.47))
-    static let addBG = dyn(c(0.129, 0.286, 0.176), c(0.851, 0.957, 0.874))
-    static let addText = dyn(c(0.588, 0.878, 0.639), c(0.086, 0.435, 0.196))
-    static let delBG = dyn(c(0.337, 0.149, 0.161), c(0.988, 0.878, 0.886))
-    static let delText = dyn(c(0.941, 0.588, 0.596), c(0.717, 0.145, 0.180))
+    static let addBG = dyn(c(0.157, 0.408, 0.239), c(0.839, 0.953, 0.867))
+    static let addText = dyn(c(0.596, 0.910, 0.659), c(0.063, 0.396, 0.153))
+    static let delBG = dyn(c(0.463, 0.180, 0.200), c(0.988, 0.867, 0.878))
+    static let delText = dyn(c(0.969, 0.616, 0.624), c(0.667, 0.106, 0.153))
     static let hunkText = dyn(c(0.573, 0.478, 0.965), c(0.416, 0.278, 0.851))
     static let border = dyn(c(0.24, 0.24, 0.24), c(0.796, 0.796, 0.827))
     static let buttonTint = dyn(c(0.30, 0.30, 0.32), c(0.855, 0.855, 0.878))
@@ -42,6 +42,7 @@ struct ContentView: View {
     @State private var selectedFileID: String?
 
     @State private var diffLines: [DiffLine] = []
+    @State private var diffRows: [DiffDisplayLine] = []
     @State private var isLoadingDiff = false
     @State private var diffTask: Task<Void, Never>?
     @State private var prefetchTask: Task<Void, Never>?
@@ -589,8 +590,8 @@ struct ContentView: View {
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
-                            ForEach(diffLines) { line in
-                                diffRow(line)
+                            ForEach(diffRows) { row in
+                                diffRow(row)
                             }
                         }
                         .padding(.vertical, 6)
@@ -644,9 +645,9 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func diffRow(_ line: DiffLine) -> some View {
+    private func diffRow(_ row: DiffDisplayLine) -> some View {
         let prefix: String = {
-            switch line.kind {
+            switch row.kind {
             case .add: return "+ "
             case .remove: return "- "
             case .context: return "  "
@@ -654,13 +655,34 @@ struct ContentView: View {
             case .note: return "* "
             }
         }()
-        Text(prefix + line.text)
-            .font(.system(size: 11.5, design: .monospaced))
-            .foregroundStyle(diffTextColor(line.kind))
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 1)
-            .background(diffBG(line.kind))
+        HStack(spacing: 0) {
+            Rectangle()
+                .fill(diffBarColor(row.kind))
+                .frame(width: 3)
+            Text(row.oldNumber.map(String.init) ?? "")
+                .frame(width: 36, alignment: .trailing)
+                .foregroundStyle(ForkTheme.textSecondary.opacity(0.6))
+            Text(row.newNumber.map(String.init) ?? "")
+                .frame(width: 40, alignment: .trailing)
+                .foregroundStyle(ForkTheme.textSecondary.opacity(0.6))
+                .padding(.trailing, 9)
+            Text(prefix + row.text)
+                .foregroundStyle(diffTextColor(row.kind))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.trailing, 12)
+                .textSelection(.enabled)
+        }
+        .font(.system(size: 11.5, design: .monospaced))
+        .padding(.vertical, 1)
+        .background(diffBG(row.kind))
+    }
+
+    private func diffBarColor(_ kind: DiffLine.Kind) -> Color {
+        switch kind {
+        case .add: return ForkTheme.addText
+        case .remove: return ForkTheme.delText
+        default: return .clear
+        }
     }
 
     private func diffTextColor(_ kind: DiffLine.Kind) -> Color {
@@ -781,7 +803,7 @@ struct ContentView: View {
         prefetchTask?.cancel()
         guard let wc = activeWC else {
             files = []
-            diffLines = []
+            setDisplayDiff([])
             return
         }
         isRefreshing = true
@@ -819,29 +841,34 @@ struct ContentView: View {
     private func loadDiff() {
         diffTask?.cancel()
         guard let wc = activeWC, let file = focusedFile else {
-            diffLines = []
+            setDisplayDiff([])
             isLoadingDiff = false
             return
         }
         let key = diffKey(for: file)
         if let cached = diffCache[key] {
-            diffLines = cached
+            setDisplayDiff(cached)
             isLoadingDiff = false
             prefetchAround(file)
             return
         }
         isLoadingDiff = true
-        diffLines = []
+        setDisplayDiff([])
         diffTask = Task {
             let lines = await loadDiffLines(for: file, wc: wc)
             guard !Task.isCancelled else { return }
             storeDiff(lines, for: key)
             if focusedFile?.id == file.id {
-                diffLines = lines
+                setDisplayDiff(lines)
                 isLoadingDiff = false
                 prefetchAround(file)
             }
         }
+    }
+
+    private func setDisplayDiff(_ lines: [DiffLine]) {
+        diffLines = lines
+        diffRows = DiffNumbering.build(lines)
     }
 
     private func loadDiffLines(for file: FileItem, wc: WorkingCopy) async -> [DiffLine] {
@@ -934,7 +961,7 @@ struct ContentView: View {
         }
         if activeWC == nil {
             files = []
-            diffLines = []
+            setDisplayDiff([])
         }
     }
 

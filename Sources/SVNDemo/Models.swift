@@ -145,6 +145,58 @@ struct WorkingCopy: Identifiable, Hashable {
     }
 }
 
+struct DiffDisplayLine: Identifiable {
+    let id: Int
+    let kind: DiffLine.Kind
+    let text: String
+    let oldNumber: Int?
+    let newNumber: Int?
+}
+
+enum DiffNumbering {
+    private static let hunkRegex = try? NSRegularExpression(pattern: #"@@ -(\d+)(?:,\d+)? \+(\d+)"#)
+
+    static func parseHunk(_ text: String) -> (old: Int, new: Int)? {
+        guard let regex = hunkRegex else { return nil }
+        let ns = text as NSString
+        guard let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)),
+              match.numberOfRanges >= 3,
+              let oldStart = Int(ns.substring(with: match.range(at: 1))),
+              let newStart = Int(ns.substring(with: match.range(at: 2))) else { return nil }
+        return (oldStart, newStart)
+    }
+
+    static func build(_ lines: [DiffLine]) -> [DiffDisplayLine] {
+        var oldLine = 0
+        var newLine = 0
+        var rows: [DiffDisplayLine] = []
+        rows.reserveCapacity(lines.count)
+        for (index, line) in lines.enumerated() {
+            switch line.kind {
+            case .hunk:
+                if let start = parseHunk(line.text) {
+                    oldLine = start.old
+                    newLine = start.new
+                }
+                rows.append(DiffDisplayLine(id: index, kind: .hunk, text: line.text, oldNumber: nil, newNumber: nil))
+            case .context:
+                rows.append(DiffDisplayLine(id: index, kind: .context, text: line.text, oldNumber: oldLine, newNumber: newLine))
+                oldLine += 1
+                newLine += 1
+            case .remove:
+                rows.append(DiffDisplayLine(id: index, kind: .remove, text: line.text, oldNumber: oldLine, newNumber: nil))
+                oldLine += 1
+            case .add:
+                rows.append(DiffDisplayLine(id: index, kind: .add, text: line.text, oldNumber: nil, newNumber: newLine))
+                newLine += 1
+            case .note:
+                rows.append(DiffDisplayLine(id: index, kind: .note, text: line.text, oldNumber: nil, newNumber: nil))
+            }
+        }
+        return rows
+    }
+}
+
 enum StatusFilter: String, CaseIterable, Identifiable {
     case all = "All"
     case modified = "Modified"
