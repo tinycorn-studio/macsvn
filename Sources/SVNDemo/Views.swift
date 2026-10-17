@@ -44,6 +44,8 @@ struct ContentView: View {
     @State private var diffLines: [DiffLine] = []
     @State private var isLoadingDiff = false
     @State private var diffTask: Task<Void, Never>?
+    @State private var prefetchTask: Task<Void, Never>?
+    @State private var diffCache: [String: [DiffLine]] = [:]
 
     @State private var showCommit = false
     @State private var showCheckout = false
@@ -573,13 +575,26 @@ struct ContentView: View {
 
                 hr
 
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(diffLines) { line in
-                            diffRow(line)
-                        }
+                if isLoadingDiff && diffLines.isEmpty {
+                    VStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading diff...")
+                            .font(.system(size: 11))
+                            .foregroundStyle(ForkTheme.textSecondary)
                     }
-                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if isBinaryPreview {
+                    binaryPreviewCard
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(diffLines) { line in
+                                diffRow(line)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
                 }
             } else {
                 VStack(spacing: 8) {
@@ -594,6 +609,38 @@ struct ContentView: View {
             }
         }
         .background(ForkTheme.bg)
+    }
+
+    private var isBinaryPreview: Bool {
+        !diffLines.isEmpty
+            && diffLines.allSatisfy { $0.kind == .note || $0.kind == .hunk }
+            && diffLines.contains { $0.text.localizedCaseInsensitiveContains("binary") }
+    }
+
+    private var binaryPreviewCard: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "photo.on.rectangle.angled")
+                .font(.system(size: 32))
+                .foregroundStyle(ForkTheme.textSecondary)
+            Text("Binary file")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(ForkTheme.textPrimary)
+            Text("svn does not show content changes for binary files.\nOpen it in Finder, or use the file's history in the repository.")
+                .font(.system(size: 11))
+                .foregroundStyle(ForkTheme.textSecondary)
+                .multilineTextAlignment(.center)
+            if let file = focusedFile {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: file.absPath)])
+                } label: {
+                    Label("Open in Finder", systemImage: "folder")
+                        .font(.system(size: 11))
+                }
+                .padding(.top, 2)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(20)
     }
 
     @ViewBuilder
@@ -630,6 +677,7 @@ struct ContentView: View {
         switch kind {
         case .add: return ForkTheme.addBG
         case .remove: return ForkTheme.delBG
+        case .hunk: return ForkTheme.panel.opacity(0.7)
         default: return .clear
         }
     }
@@ -730,6 +778,7 @@ struct ContentView: View {
     }
 
     private func refreshStatus() async {
+        prefetchTask?.cancel()
         guard let wc = activeWC else {
             files = []
             diffLines = []
@@ -774,24 +823,77 @@ struct ContentView: View {
             isLoadingDiff = false
             return
         }
-        isLoadingDiff = true
-        diffTask = Task {
-            let lines: [DiffLine]
-            if file.status == .unversioned {
-                lines = SVN.unversionedDiff(atAbsolutePath: file.absPath)
-            } else if file.status == .missing {
-                lines = await SVN.missingFileDiff(relativePath: file.relativePath, in: wc.path)
-            } else {
-                do {
-                    let text = try await SVN.diffText(relativePath: file.relativePath, in: wc.path)
-                    lines = SVN.parseDiff(text)
-                } catch {
-                    lines = [DiffLine(kind: .note, text: "Could not load diff: \(error.localizedDescription)")]
-                }
-            }
-            guard !Task.isCancelled else { return }
-            diffLines = lines.isEmpty ? [DiffLine(kind: .note, text: "No differences.")] : lines
+        let key = diffKey(for: file)
+        if let cached = diffCache[key] {
+            diffLines = cached
             isLoadingDiff = false
+            prefetchAround(file)
+            return
+        }
+        isLoadingDiff = true
+        diffLines = []
+        diffTask = Task {
+            let lines = await loadDiffLines(for: file, wc: wc)
+            guard !Task.isCancelled else { return }
+            storeDiff(lines, for: key)
+            if focusedFile?.id == file.id {
+                diffLines = lines
+                isLoadingDiff = false
+                prefetchAround(file)
+            }
+        }
+    }
+
+    private func loadDiffLines(for file: FileItem, wc: WorkingCopy) async -> [DiffLine] {
+        var lines: [DiffLine]
+        if file.status == .unversioned {
+            lines = await SVN.unversionedDiff(atAbsolutePath: file.absPath)
+        } else if file.status == .missing {
+            lines = await SVN.missingFileDiff(relativePath: file.relativePath, in: wc.path)
+        } else {
+            do {
+                let text = try await SVN.diffText(relativePath: file.relativePath, in: wc.path)
+                lines = SVN.parseDiff(text)
+            } catch {
+                lines = [DiffLine(kind: .note, text: "Could not load diff: \(error.localizedDescription)")]
+            }
+        }
+        if lines.isEmpty {
+            if file.status == .modified {
+                lines = [DiffLine(kind: .note, text: "No content differences - the change may be in file properties or line endings.")]
+            } else {
+                lines = [DiffLine(kind: .note, text: "No differences.")]
+            }
+        }
+        return lines
+    }
+
+    private func diffKey(for file: FileItem) -> String {
+        "\(file.id)|\(file.mtimeKey)|\(file.status.rawValue)"
+    }
+
+    private func storeDiff(_ lines: [DiffLine], for key: String) {
+        diffCache[key] = lines
+        if diffCache.count > 120 {
+            diffCache.removeAll()
+        }
+    }
+
+    private func prefetchAround(_ file: FileItem) {
+        guard let wc = activeWC,
+              let index = visibleFiles.firstIndex(where: { $0.id == file.id }) else { return }
+        let upcoming = Array(visibleFiles.dropFirst(index + 1).prefix(2))
+        guard !upcoming.isEmpty else { return }
+        prefetchTask?.cancel()
+        prefetchTask = Task(priority: .utility) {
+            for next in upcoming {
+                if Task.isCancelled { return }
+                let key = diffKey(for: next)
+                guard diffCache[key] == nil else { continue }
+                let lines = await loadDiffLines(for: next, wc: wc)
+                if Task.isCancelled { return }
+                storeDiff(lines, for: key)
+            }
         }
     }
 

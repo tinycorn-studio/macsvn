@@ -68,6 +68,7 @@ struct FileItem: Identifiable {
     var revision: Int
     var author: String
     var date: String
+    var mtimeKey: String
     var isChecked: Bool = true
 
     var displayName: String {
@@ -75,24 +76,36 @@ struct FileItem: Identifiable {
     }
 
     init?(entry: SVNStatusEntry, wcPath: String) {
-        guard let status = FileStatus(from: entry.item) else { return nil }
+        guard let base = FileStatus(from: entry.item) else { return nil }
         let path = entry.path
         let nsPath = path as NSString
         let last = nsPath.lastPathComponent
         let stem = (last as NSString).deletingPathExtension
         let ext = (last as NSString).pathExtension.lowercased()
         let dir = nsPath.deletingLastPathComponent
+        let absolute = (wcPath as NSString).appendingPathComponent(path)
 
         self.name = stem.isEmpty ? last : stem
         self.ext = ext
         self.folder = dir.isEmpty ? "." : dir
         self.relativePath = path
-        self.absPath = (wcPath as NSString).appendingPathComponent(path)
-        self.status = status
+        self.absPath = absolute
+        if base == .normal && entry.props == "modified" {
+            self.status = .modified
+        } else {
+            self.status = base
+        }
         self.revision = entry.revision > 0 ? entry.revision : entry.lastChangedRevision
         self.author = entry.author
         self.date = FileItem.formatDate(entry.date)
+        self.mtimeKey = FileItem.modificationKey(forAbsPath: absolute)
         self.isChecked = true
+    }
+
+    private static func modificationKey(forAbsPath path: String) -> String {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let date = attributes[.modificationDate] as? Date else { return "none" }
+        return String(date.timeIntervalSince1970)
     }
 
     private static let dateFormatter: DateFormatter = {

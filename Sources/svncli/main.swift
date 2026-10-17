@@ -58,6 +58,7 @@ case "status":
             case .unversioned: badge = "?"
             case .missing: badge = "!"
             case .conflicted: badge = "C"
+            case .normal: badge = entry.props == "modified" ? "M" : " "
             default: badge = " "
             }
             let author = entry.author.isEmpty ? "-" : entry.author

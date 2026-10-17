@@ -127,18 +127,25 @@ public struct SVNStatusEntry: Sendable {
 
     public let path: String
     public let item: Item
+    public let props: String
     public let revision: Int
     public let lastChangedRevision: Int
     public let author: String
     public let date: Date?
 
-    public init(path: String, item: Item, revision: Int, lastChangedRevision: Int, author: String, date: Date?) {
+    public init(path: String, item: Item, props: String = "none", revision: Int,
+                lastChangedRevision: Int, author: String, date: Date?) {
         self.path = path
         self.item = item
+        self.props = props
         self.revision = revision
         self.lastChangedRevision = lastChangedRevision
         self.author = author
         self.date = date
+    }
+
+    public var isPropertyOnlyChange: Bool {
+        item == .normal && props == "modified"
     }
 }
 
@@ -392,6 +399,7 @@ public enum SVN {
                 continue
             }
 
+            let props = wcStatus.attribute(forName: "props")?.stringValue ?? "none"
             let revision = Int(wcStatus.attribute(forName: "revision")?.stringValue ?? "") ?? 0
             var lastRevision = revision
             var author = ""
@@ -404,6 +412,7 @@ public enum SVN {
             entries.append(SVNStatusEntry(
                 path: path,
                 item: item,
+                props: props,
                 revision: revision,
                 lastChangedRevision: lastRevision,
                 author: author,
@@ -421,11 +430,15 @@ public enum SVN {
         return result.stdout
     }
 
-    public static func parseDiff(_ text: String) -> [DiffLine] {
+    public static func parseDiff(_ text: String, maxLines: Int = 20_000) -> [DiffLine] {
         var lines: [DiffLine] = []
         for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if lines.count >= maxLines {
+                lines.append(DiffLine(kind: .note, text: "Diff truncated (too many lines to display)."))
+                break
+            }
             let line = String(raw)
-            if line.hasPrefix("@@") {
+            if line.hasPrefix("@@") || line.hasPrefix("## ") || line.hasPrefix("## -") {
                 lines.append(DiffLine(kind: .hunk, text: line))
             } else if line.hasPrefix("+++") || line.hasPrefix("---")
                         || line.hasPrefix("Index:") || line.hasPrefix("===")
@@ -469,30 +482,43 @@ public enum SVN {
         }
     }
 
-    public static func unversionedDiff(atAbsolutePath path: String) -> [DiffLine] {
-        let name = URL(fileURLWithPath: path).lastPathComponent
-        guard let data = FileManager.default.contents(atPath: path) else {
-            return [DiffLine(kind: .note, text: "File not found on disk: \(path)")]
-        }
-        let looksBinary = data.contains(0) || String(data: data, encoding: .utf8) == nil
-        if looksBinary {
-            return [
-                DiffLine(kind: .hunk, text: "@@ binary @@"),
-                DiffLine(kind: .note, text: "Binary file '\(name)' (preview not available)")
+    public static func unversionedDiff(atAbsolutePath path: String, maxBytes: Int64 = 3_000_000) async -> [DiffLine] {
+        await Task.detached(priority: .userInitiated) {
+            let name = URL(fileURLWithPath: path).lastPathComponent
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  let size = (attributes[.size] as? NSNumber)?.int64Value else {
+                return [DiffLine(kind: .note, text: "File not found on disk: \(path)")]
+            }
+            if size > maxBytes {
+                let formatted = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+                return [
+                    DiffLine(kind: .hunk, text: "@@ large file @@"),
+                    DiffLine(kind: .note, text: "File too large to preview (\(formatted)). Open it in Finder instead.")
+                ]
+            }
+            guard let data = FileManager.default.contents(atPath: path) else {
+                return [DiffLine(kind: .note, text: "File not found on disk: \(path)")]
+            }
+            let looksBinary = data.contains(0) || String(data: data, encoding: .utf8) == nil
+            if looksBinary {
+                return [
+                    DiffLine(kind: .hunk, text: "@@ binary @@"),
+                    DiffLine(kind: .note, text: "Binary file '\(name)' (preview not available)")
+                ]
+            }
+            let text = String(decoding: data, as: UTF8.self)
+            var contentLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            if contentLines.last == "" { contentLines.removeLast() }
+            var lines: [DiffLine] = [
+                DiffLine(kind: .hunk, text: "@@ -0,0 +1,\(contentLines.count) @@")
             ]
-        }
-        let text = String(decoding: data, as: UTF8.self)
-        var contentLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        if contentLines.last == "" { contentLines.removeLast() }
-        var lines: [DiffLine] = [
-            DiffLine(kind: .hunk, text: "@@ -0,0 +1,\(contentLines.count) @@")
-        ]
-        if contentLines.isEmpty {
-            lines.append(DiffLine(kind: .note, text: "Empty file"))
-        } else {
-            lines.append(contentsOf: contentLines.map { DiffLine(kind: .add, text: $0) })
-        }
-        return lines
+            if contentLines.isEmpty {
+                lines.append(DiffLine(kind: .note, text: "Empty file"))
+            } else {
+                lines.append(contentsOf: contentLines.prefix(20_000).map { DiffLine(kind: .add, text: $0) })
+            }
+            return lines
+        }.value
     }
 
     // MARK: Mutations
