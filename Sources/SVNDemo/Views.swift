@@ -1,0 +1,947 @@
+import SwiftUI
+import AppKit
+
+enum ForkTheme {
+    static let bg = Color(red: 0.121, green: 0.125, blue: 0.137)
+    static let panel = Color(red: 0.145, green: 0.149, blue: 0.165)
+    static let sidebar = Color(red: 0.106, green: 0.110, blue: 0.122)
+    static let rowSelected = Color(red: 0.223, green: 0.333, blue: 0.588)
+    static let accent = Color(red: 0.357, green: 0.565, blue: 1.0)
+    static let textPrimary = Color(white: 0.93)
+    static let textSecondary = Color(white: 0.58)
+    static let addBG = Color(red: 0.129, green: 0.286, blue: 0.176)
+    static let addText = Color(red: 0.588, green: 0.878, blue: 0.639)
+    static let delBG = Color(red: 0.337, green: 0.149, blue: 0.161)
+    static let delText = Color(red: 0.941, green: 0.588, blue: 0.596)
+    static let hunkText = Color(red: 0.573, green: 0.478, blue: 0.965)
+    static let border = Color(white: 0.24)
+}
+
+struct ContentView: View {
+    @State private var workingCopies = Mock.workingCopies
+    @State private var selectedWCID: UUID?
+    @State private var files = Mock.files
+    @State private var filter: StatusFilter = .all
+    @State private var search = ""
+    @State private var selectedFileID: UUID?
+
+    @State private var showCommit = false
+    @State private var showCheckout = false
+    @State private var showRevertConfirm = false
+    @State private var showUpdate = false
+    @State private var toast: String?
+    @State private var draftMessage = ""
+
+    private var activeWC: WorkingCopy {
+        workingCopies.first { $0.id == selectedWCID } ?? workingCopies[0]
+    }
+
+    private var visibleFiles: [FileItem] {
+        files.filter { item in
+            item.status.isChanged
+                && filter.matches(item.status)
+                && (search.isEmpty
+                    || item.name.localizedCaseInsensitiveContains(search)
+                    || item.folder.localizedCaseInsensitiveContains(search))
+        }
+    }
+
+    private var checkedFiles: [FileItem] {
+        files.filter { $0.isChecked && $0.status.isChanged }
+    }
+
+    private var focusedFile: FileItem? {
+        files.first { $0.id == selectedFileID } ?? visibleFiles.first
+    }
+
+    private func count(of status: FileStatus) -> Int {
+        files.filter { $0.status == status }.count
+    }
+
+    private func checkBinding(for item: FileItem) -> Binding<Bool> {
+        Binding(
+            get: { files.first { $0.id == item.id }?.isChecked ?? false },
+            set: { value in
+                if let idx = files.firstIndex(where: { $0.id == item.id }) {
+                    files[idx].isChecked = value
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            topBar
+            hr
+            HStack(spacing: 0) {
+                sidebarPanel
+                hrVertical
+                changesPanel
+                hrVertical
+                diffPanel
+            }
+            hr
+            commitBar
+        }
+        .background(ForkTheme.bg)
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $showCommit) {
+            CommitSheet(wc: activeWC, files: $files, draftMessage: $draftMessage) { count in
+                showToast("Committed \(count) file(s) at r\(activeWC.revision + 1)")
+                bumpRevision()
+            }
+        }
+        .sheet(isPresented: $showCheckout) {
+            CheckoutSheet { wc in
+                workingCopies.append(wc)
+                selectedWCID = wc.id
+                showToast("Checked out \(wc.name) at r\(wc.revision)")
+            }
+        }
+        .sheet(isPresented: $showUpdate) {
+            UpdateProgressSheet(wc: activeWC) {
+                bumpRevision()
+                showToast("Updated \(activeWC.name) to r\(activeWC.revision + 1)")
+            }
+        }
+        .alert("Revert \(checkedFiles.count) file(s)?", isPresented: $showRevertConfirm) {
+            Button("Revert", role: .destructive) { performRevert() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("All local modifications will be permanently lost (discard changes). This cannot be undone.")
+        }
+        .overlay(alignment: .bottom) {
+            if let toast {
+                Text(toast)
+                    .font(.callout)
+                    .foregroundStyle(ForkTheme.textPrimary)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Color(white: 0.22), in: Capsule())
+                    .overlay(Capsule().stroke(ForkTheme.border))
+                    .padding(.bottom, 92)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .onAppear {
+            if selectedWCID == nil { selectedWCID = workingCopies.first?.id }
+        }
+        .frame(minWidth: 1180, minHeight: 720)
+    }
+
+    private var hr: some View {
+        Rectangle().fill(ForkTheme.border).frame(height: 1)
+    }
+
+    private var hrVertical: some View {
+        Rectangle().fill(ForkTheme.border).frame(width: 1)
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "shippingbox.fill")
+                .foregroundStyle(ForkTheme.accent)
+            Text("MacSVN")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(ForkTheme.textPrimary)
+            Text(activeWC.name)
+                .font(.system(size: 12))
+                .foregroundStyle(ForkTheme.textSecondary)
+
+            Spacer()
+
+            HStack(spacing: 6) {
+                Text(activeWC.branch)
+                    .font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 3)
+                    .background(ForkTheme.panel, in: Capsule())
+                    .foregroundStyle(ForkTheme.textPrimary)
+                Text("r\(activeWC.revision)")
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 3)
+                    .background(Color.green.opacity(0.22), in: Capsule())
+                    .foregroundStyle(.green)
+            }
+
+            Spacer()
+
+            toolbarIcon("square.and.arrow.down", "Checkout...") { showCheckout = true }
+            toolbarIcon("arrow.uturn.backward", "Revert - discard changes...") { showRevertConfirm = true }
+                .disabled(checkedFiles.isEmpty)
+            toolbarIcon("arrow.clockwise", "Refresh status") { showToast("Status refreshed") }
+                .keyboardShortcut("r", modifiers: .command)
+
+            Button {
+                showUpdate = true
+            } label: {
+                Label("Update", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Color(white: 0.30))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(ForkTheme.sidebar)
+    }
+
+    private func toolbarIcon(_ symbol: String, _ help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(ForkTheme.textPrimary)
+                .frame(width: 28, height: 24)
+                .background(ForkTheme.panel, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private var sidebarPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("REPOSITORIES")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(ForkTheme.textSecondary)
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                .padding(.bottom, 6)
+
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(workingCopies) { wc in
+                        wcRow(wc)
+                    }
+                }
+                .padding(.horizontal, 6)
+            }
+
+            hr
+
+            Button {
+                showCheckout = true
+            } label: {
+                Label("Add working copy...", systemImage: "plus.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(ForkTheme.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .padding(12)
+        }
+        .frame(width: 215)
+        .background(ForkTheme.sidebar)
+    }
+
+    private func wcRow(_ wc: WorkingCopy) -> some View {
+        let selected = wc.id == activeWC.id
+        return HStack(spacing: 8) {
+            Image(systemName: "shippingbox.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(selected ? .white : ForkTheme.accent)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(wc.name)
+                    .font(.system(size: 12, weight: selected ? .semibold : .regular))
+                    .foregroundStyle(selected ? .white : ForkTheme.textPrimary)
+                Text("\(wc.branch) - r\(wc.revision)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(selected ? Color.white.opacity(0.75) : ForkTheme.textSecondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(selected ? ForkTheme.rowSelected : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+        .onTapGesture { selectedWCID = wc.id }
+    }
+
+    private var changesPanel: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text("Changes")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(ForkTheme.textPrimary)
+                Text("\(visibleFiles.count)")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(ForkTheme.accent)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(ForkTheme.accent.opacity(0.16), in: Capsule())
+                Spacer()
+                Menu {
+                    ForEach(StatusFilter.allCases) { f in
+                        Button("\(f.rawValue) (\(filterCount(f)))") { filter = f }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "line.3.horizontal.decrease.circle")
+                        Text(filter.rawValue)
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(ForkTheme.textSecondary)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textSecondary)
+                TextField("Filter files", text: $search)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(ForkTheme.textPrimary)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
+            .padding(.horizontal, 10)
+            .padding(.bottom, 8)
+
+            hr
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(visibleFiles) { item in
+                        changeRow(item)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+
+            hr
+
+            HStack(spacing: 8) {
+                Button("Check all") {
+                    for i in files.indices where files[i].status.isChanged {
+                        files[i].isChecked = true
+                    }
+                }
+                Button("Uncheck all") {
+                    for i in files.indices {
+                        files[i].isChecked = false
+                    }
+                }
+                Spacer()
+                Text(summaryText)
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11))
+            .foregroundStyle(ForkTheme.accent)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+        }
+        .frame(width: 330)
+        .background(ForkTheme.panel)
+    }
+
+    private func filterCount(_ f: StatusFilter) -> Int {
+        switch f {
+        case .all: return files.filter { $0.status.isChanged }.count
+        case .modified: return count(of: .modified)
+        case .added: return count(of: .added)
+        case .unversioned: return count(of: .unversioned)
+        case .missing: return count(of: .missing)
+        case .conflicted: return count(of: .conflicted)
+        }
+    }
+
+    private var summaryText: String {
+        let m = count(of: .modified)
+        let a = count(of: .added)
+        let u = count(of: .unversioned)
+        let x = count(of: .missing)
+        let c = count(of: .conflicted)
+        return "\(m)M \(a)A \(u)? \(x)! \(c)C"
+    }
+
+    private func changeRow(_ item: FileItem) -> some View {
+        let selected = item.id == (focusedFile?.id ?? UUID())
+        return HStack(spacing: 9) {
+            Button {
+                if let idx = files.firstIndex(where: { $0.id == item.id }) {
+                    files[idx].isChecked.toggle()
+                }
+            } label: {
+                Image(systemName: item.isChecked ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 14))
+                    .foregroundStyle(item.isChecked ? ForkTheme.accent : ForkTheme.textSecondary)
+            }
+            .buttonStyle(.plain)
+
+            Text(item.status.badge)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(item.status.color)
+                .frame(width: 15)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.displayName)
+                    .font(.system(size: 12))
+                    .foregroundStyle(ForkTheme.textPrimary)
+                    .lineLimit(1)
+                Text(item.folder)
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(selected ? ForkTheme.rowSelected.opacity(0.45) : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture { selectedFileID = item.id }
+        .contextMenu { rowMenu(item) }
+    }
+
+    @ViewBuilder
+    private func rowMenu(_ item: FileItem) -> some View {
+        Button("Update") { showUpdate = true }
+        Button("Commit...") {
+            if let idx = files.firstIndex(where: { $0.id == item.id }) {
+                files[idx].isChecked = true
+            }
+            selectedFileID = item.id
+            showCommit = true
+        }
+        Button("Revert (discard changes)...") {
+            if let idx = files.firstIndex(where: { $0.id == item.id }) {
+                files[idx].isChecked = true
+            }
+            showRevertConfirm = true
+        }
+        Divider()
+        Menu("Ignore") {
+            Button("Ignore \"\(item.displayName)\"") { ignore(item, mode: .file) }
+            if !item.ext.isEmpty {
+                Button("Ignore all *.\(item.ext) files") { ignore(item, mode: .extension) }
+            }
+            if item.folder != "." {
+                Button("Ignore folder \"\(item.folder)\"") { ignore(item, mode: .folder) }
+            }
+        }
+        Divider()
+        Button("Open in Finder") {
+            NSWorkspace.shared.activateFileViewerSelecting([
+                URL(fileURLWithPath: activeWC.path).appendingPathComponent(item.folder)
+            ])
+        }
+        Button("Diff...") {}
+            .disabled(item.status != .modified)
+    }
+
+    private var diffPanel: some View {
+        VStack(spacing: 0) {
+            if let file = focusedFile {
+                HStack(spacing: 8) {
+                    StatusBadge(status: file.status)
+                    Text(file.displayName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(ForkTheme.textPrimary)
+                    Text(file.folder)
+                        .font(.system(size: 11))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    Spacer()
+                    if file.revision > 0 {
+                        Text("base r\(file.revision)")
+                            .font(.system(size: 10))
+                            .foregroundStyle(ForkTheme.textSecondary)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+
+                hr
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(file.mockDiff) { line in
+                            diffRow(line)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                }
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 30))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    Text("Select a file to view changes")
+                        .font(.system(size: 12))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .background(ForkTheme.bg)
+    }
+
+    @ViewBuilder
+    private func diffRow(_ line: DiffLine) -> some View {
+        let prefix: String = {
+            switch line.kind {
+            case .add: return "+ "
+            case .remove: return "- "
+            case .context: return "  "
+            case .hunk: return ""
+            case .note: return "* "
+            }
+        }()
+        Text(prefix + line.text)
+            .font(.system(size: 11.5, design: .monospaced))
+            .foregroundStyle(diffTextColor(line.kind))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 1)
+            .background(diffBG(line.kind))
+    }
+
+    private func diffTextColor(_ kind: DiffLine.Kind) -> Color {
+        switch kind {
+        case .add: return ForkTheme.addText
+        case .remove: return ForkTheme.delText
+        case .context: return ForkTheme.textPrimary.opacity(0.85)
+        case .hunk: return ForkTheme.hunkText
+        case .note: return ForkTheme.textSecondary
+        }
+    }
+
+    private func diffBG(_ kind: DiffLine.Kind) -> Color {
+        switch kind {
+        case .add: return ForkTheme.addBG
+        case .remove: return ForkTheme.delBG
+        default: return .clear
+        }
+    }
+
+    private var commitBar: some View {
+        HStack(alignment: .bottom, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    Text("Message")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    Menu {
+                        Button("Update app layout and assets") { draftMessage = "Update app layout and assets" }
+                        Button("Fix config parsing bug") { draftMessage = "Fix config parsing bug" }
+                        Button("Add new icons and docs") { draftMessage = "Add new icons and docs" }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "clock.arrow.circlepath")
+                            Text("Recent")
+                        }
+                        .font(.system(size: 10))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
+
+                TextEditor(text: $draftMessage)
+                    .font(.system(size: 12))
+                    .foregroundStyle(ForkTheme.textPrimary)
+                    .scrollContentBackground(.hidden)
+                    .padding(6)
+                    .frame(height: 58)
+                    .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
+            }
+
+            VStack(alignment: .trailing, spacing: 6) {
+                Button {
+                    showCommit = true
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.up.circle.fill")
+                        Text("Commit \(checkedFiles.count) File\(checkedFiles.count == 1 ? "" : "s")")
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(minWidth: 150)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .tint(ForkTheme.accent)
+                .disabled(checkedFiles.isEmpty)
+
+                Text("\(checkedFiles.count) of \(files.filter { $0.status.isChanged }.count) selected")
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textSecondary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(ForkTheme.sidebar)
+    }
+
+    private func bumpRevision() {
+        guard let idx = workingCopies.firstIndex(where: { $0.id == activeWC.id }) else { return }
+        workingCopies[idx].revision += 1
+    }
+
+    private func performRevert() {
+        let checked = checkedFiles
+        for item in checked {
+            guard let idx = files.firstIndex(where: { $0.id == item.id }) else { continue }
+            if item.status == .unversioned {
+                files.remove(at: idx)
+            } else {
+                files[idx].status = .normal
+                files[idx].isChecked = false
+            }
+        }
+        showToast("Reverted \(checked.count) file(s)")
+    }
+
+    private func ignore(_ item: FileItem, mode: IgnoreMode) {
+        switch mode {
+        case .file:
+            files.removeAll { $0.id == item.id }
+            showToast("Added \"\(item.displayName)\" to ignore list")
+        case .extension:
+            files.removeAll { $0.ext == item.ext && $0.status == .unversioned }
+            showToast("Added \"*.\(item.ext)\" to ignore list")
+        case .folder:
+            files.removeAll { $0.folder.hasPrefix(item.folder) && $0.status == .unversioned }
+            showToast("Added \"\(item.folder)\" to ignore list")
+        }
+    }
+
+    private func showToast(_ text: String) {
+        withAnimation { toast = text }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
+            withAnimation { toast = nil }
+        }
+    }
+}
+
+enum IgnoreMode {
+    case file
+    case `extension`
+    case folder
+}
+
+struct StatusBadge: View {
+    let status: FileStatus
+
+    var body: some View {
+        Text(status.badge)
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .foregroundStyle(.white)
+            .frame(width: 18, height: 16)
+            .background(status.color.gradient, in: RoundedRectangle(cornerRadius: 4))
+            .help(status.label)
+    }
+}
+
+struct CommitSheet: View {
+    let wc: WorkingCopy
+    @Binding var files: [FileItem]
+    @Binding var draftMessage: String
+    var onCommit: (Int) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var message = ""
+    @State private var keepLocks = false
+
+    private var commitable: [FileItem] {
+        files.filter { $0.status.isChanged }
+    }
+
+    private var checkedCount: Int {
+        files.filter { $0.isChecked && $0.status.isChanged }.count
+    }
+
+    private func binding(for item: FileItem) -> Binding<Bool> {
+        Binding(
+            get: { files.first { $0.id == item.id }?.isChecked ?? false },
+            set: { value in
+                if let idx = files.firstIndex(where: { $0.id == item.id }) {
+                    files[idx].isChecked = value
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .foregroundStyle(ForkTheme.accent)
+                Text("Commit to \(activeName)")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(ForkTheme.textPrimary)
+                Spacer()
+                Text("r\(wc.revision)")
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.green.opacity(0.22), in: Capsule())
+                    .foregroundStyle(.green)
+            }
+
+            Text(wc.url)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(ForkTheme.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(commitable) { item in
+                        HStack(spacing: 9) {
+                            Toggle("", isOn: binding(for: item))
+                                .toggleStyle(.checkbox)
+                                .labelsHidden()
+                            Text(item.status.badge)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundStyle(item.status.color)
+                                .frame(width: 15)
+                            Text(item.displayName)
+                                .font(.system(size: 12))
+                                .foregroundStyle(ForkTheme.textPrimary)
+                                .frame(width: 190, alignment: .leading)
+                                .lineLimit(1)
+                            Text(item.folder)
+                                .font(.system(size: 11))
+                                .foregroundStyle(ForkTheme.textSecondary)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+            .frame(height: 200)
+            .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
+
+            Text("Message")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(ForkTheme.textSecondary)
+
+            TextEditor(text: $message)
+                .font(.system(size: 12))
+                .foregroundStyle(ForkTheme.textPrimary)
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .frame(height: 80)
+                .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
+
+            HStack {
+                Toggle("Keep locks", isOn: $keepLocks)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 11))
+                    .foregroundStyle(ForkTheme.textSecondary)
+                Spacer()
+                Text("\(checkedCount) file(s)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(ForkTheme.textSecondary)
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button {
+                    performCommit()
+                } label: {
+                    Label("Commit", systemImage: "checkmark.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(ForkTheme.accent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || checkedCount == 0)
+            }
+        }
+        .padding(18)
+        .frame(width: 640)
+        .background(ForkTheme.sidebar)
+        .preferredColorScheme(.dark)
+        .onAppear { message = draftMessage }
+    }
+
+    private var activeName: String {
+        wc.name
+    }
+
+    private func performCommit() {
+        for idx in files.indices where files[idx].isChecked && files[idx].status.isChanged {
+            files[idx].status = .normal
+            files[idx].isChecked = false
+        }
+        draftMessage = message
+        onCommit(checkedCount)
+        dismiss()
+    }
+}
+
+struct CheckoutSheet: View {
+    var onCheckout: (WorkingCopy) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var url = "http://svn.example.com/repos/demo/DemoProject"
+    @State private var destination = NSHomeDirectory() + "/Projects/"
+    @State private var revision = "HEAD"
+    @State private var depth = "Fully recursive"
+    @State private var name = "DemoProject"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "square.and.arrow.down.fill")
+                    .foregroundStyle(ForkTheme.accent)
+                Text("Checkout")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(ForkTheme.textPrimary)
+            }
+
+            Text("URL of repository")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(ForkTheme.textSecondary)
+            TextField("http://...", text: $url)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+
+            Text("Checkout directory")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(ForkTheme.textSecondary)
+            HStack {
+                TextField("Directory", text: $destination)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+                Button("Choose...") {}
+            }
+
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Revision")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    Picker("", selection: $revision) {
+                        Text("HEAD revision").tag("HEAD")
+                        Text("Revision 1523").tag("1523")
+                        Text("Revision 1520").tag("1520")
+                    }
+                    .labelsHidden()
+                    .frame(width: 160)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Checkout depth")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    Picker("", selection: $depth) {
+                        Text("Fully recursive").tag("Fully recursive")
+                        Text("Immediate children").tag("Immediate children")
+                        Text("Only this item").tag("Only this item")
+                    }
+                    .labelsHidden()
+                    .frame(width: 180)
+                }
+                Spacer()
+            }
+
+            Toggle("Omit externals", isOn: .constant(false))
+                .toggleStyle(.checkbox)
+                .font(.system(size: 11))
+                .foregroundStyle(ForkTheme.textSecondary)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Checkout") {
+                    onCheckout(WorkingCopy(
+                        name: name,
+                        path: destination + name,
+                        url: url,
+                        branch: "trunk",
+                        revision: 1523
+                    ))
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(ForkTheme.accent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(url.isEmpty || destination.isEmpty)
+            }
+        }
+        .padding(18)
+        .frame(width: 620)
+        .background(ForkTheme.sidebar)
+        .preferredColorScheme(.dark)
+    }
+}
+
+struct UpdateProgressSheet: View {
+    let wc: WorkingCopy
+    var onFinish: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var lines: [String] = []
+    @State private var progress: Double = 0
+
+    private let steps: [(String, Double)] = [
+        ("Updating '\(Mock.workingCopies.first?.url ?? "")':", 0.1),
+        ("Updating 'Resources':", 0.25),
+        ("U  Resources/icon.png", 0.4),
+        ("U  src/Utils/StringExt.swift", 0.6),
+        ("Updating 'src':", 0.75),
+        ("G  src/Core/Engine.swift", 0.9),
+        ("Updated to revision \(1524).", 1.0),
+        ("Done.", 1.0)
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(ForkTheme.accent)
+                Text("Update - \(wc.name)")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(ForkTheme.textPrimary)
+                Spacer()
+            }
+            ProgressView(value: progress)
+                .tint(ForkTheme.accent)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(line.hasPrefix("U ") || line.hasPrefix("G ") ? ForkTheme.addText : ForkTheme.textSecondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 150)
+            .padding(8)
+            .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
+
+            HStack {
+                Spacer()
+                Button("Close") { dismiss() }
+                    .disabled(progress < 1.0)
+            }
+        }
+        .padding(18)
+        .frame(width: 560)
+        .background(ForkTheme.sidebar)
+        .preferredColorScheme(.dark)
+        .task {
+            for step in steps {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                lines.append(step.0)
+                progress = step.1
+            }
+            onFinish()
+        }
+    }
+}
