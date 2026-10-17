@@ -5,6 +5,8 @@ let package = Package(
     name: "SVNDemo",
     platforms: [.macOS(.v14)],
     targets: [
-        .executableTarget(name: "SVNDemo", path: "Sources/SVNDemo")
+        .target(name: "SVNCore", path: "Sources/SVNCore"),
+        .executableTarget(name: "SVNDemo", dependencies: ["SVNCore"], path: "Sources/SVNDemo"),
+        .executableTarget(name: "svncli", dependencies: ["SVNCore"], path: "Sources/svncli")
     ]
 )

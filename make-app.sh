@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 
 APP_NAME="MacSVN"
 BUNDLE_ID="com.macsvn.app"
-VERSION="0.3.0"
+VERSION="0.4.0"
 DIST="dist"
 
 echo "==> Building release binary..."

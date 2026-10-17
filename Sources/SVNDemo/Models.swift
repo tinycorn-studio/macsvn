@@ -1,4 +1,5 @@
 import SwiftUI
+import SVNCore
 
 enum FileStatus: String, CaseIterable {
     case modified
@@ -7,6 +8,18 @@ enum FileStatus: String, CaseIterable {
     case missing
     case conflicted
     case normal
+
+    init?(from item: SVNStatusEntry.Item) {
+        switch item {
+        case .modified, .replaced: self = .modified
+        case .added: self = .added
+        case .unversioned: self = .unversioned
+        case .missing, .deleted: self = .missing
+        case .conflicted: self = .conflicted
+        case .normal: self = .normal
+        case .ignored, .external, .incomplete: return nil
+        }
+    }
 
     var badge: String {
         switch self {
@@ -45,24 +58,78 @@ enum FileStatus: String, CaseIterable {
 }
 
 struct FileItem: Identifiable {
-    let id = UUID()
+    var id: String { relativePath }
     var name: String
-    var folder: String
     var ext: String
+    var folder: String
+    var relativePath: String
+    var absPath: String
     var status: FileStatus
     var revision: Int
     var author: String
     var date: String
     var isChecked: Bool = true
+
+    var displayName: String {
+        ext.isEmpty ? name : "\(name).\(ext)"
+    }
+
+    init?(entry: SVNStatusEntry, wcPath: String) {
+        guard let status = FileStatus(from: entry.item) else { return nil }
+        let path = entry.path
+        let nsPath = path as NSString
+        let last = nsPath.lastPathComponent
+        let stem = (last as NSString).deletingPathExtension
+        let ext = (last as NSString).pathExtension.lowercased()
+        let dir = nsPath.deletingLastPathComponent
+
+        self.name = stem.isEmpty ? last : stem
+        self.ext = ext
+        self.folder = dir.isEmpty ? "." : dir
+        self.relativePath = path
+        self.absPath = (wcPath as NSString).appendingPathComponent(path)
+        self.status = status
+        self.revision = entry.revision > 0 ? entry.revision : entry.lastChangedRevision
+        self.author = entry.author
+        self.date = FileItem.formatDate(entry.date)
+        self.isChecked = true
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm dd/MM"
+        return formatter
+    }()
+
+    static func formatDate(_ date: Date?) -> String {
+        guard let date else { return "" }
+        return dateFormatter.string(from: date)
+    }
 }
 
 struct WorkingCopy: Identifiable, Hashable {
-    let id = UUID()
+    var id: String { path }
     var name: String
     var path: String
     var url: String
     var branch: String
     var revision: Int
+
+    init(info: SVNInfo) {
+        self.name = info.name
+        self.path = info.path
+        self.url = info.url
+        self.branch = info.branch
+        self.revision = info.revision
+    }
+
+    init(name: String, path: String, url: String, branch: String, revision: Int) {
+        self.name = name
+        self.path = path
+        self.url = url
+        self.branch = branch
+        self.revision = revision
+    }
 }
 
 enum StatusFilter: String, CaseIterable, Identifiable {
@@ -85,18 +152,4 @@ enum StatusFilter: String, CaseIterable, Identifiable {
         case .conflicted: return status == .conflicted
         }
     }
-}
-
-struct DiffLine: Identifiable {
-    enum Kind {
-        case context
-        case add
-        case remove
-        case hunk
-        case note
-    }
-
-    let id = UUID()
-    let kind: Kind
-    let text: String
 }

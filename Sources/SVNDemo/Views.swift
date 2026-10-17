@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import SVNCore
 
 enum ForkTheme {
     private static func dyn(_ dark: NSColor, _ light: NSColor) -> Color {
@@ -30,25 +31,33 @@ enum ForkTheme {
 }
 
 struct ContentView: View {
-    @State private var workingCopies = Mock.workingCopies
-    @State private var selectedWCID: UUID?
-    @State private var files = Mock.files
+    private static let wcPathsKey = "wcPaths"
+    private static let recentMessagesKey = "recentMessages"
+
+    @State private var workingCopies: [WorkingCopy] = []
+    @State private var selectedWCID: String?
+    @State private var files: [FileItem] = []
     @State private var filter: StatusFilter = .all
     @State private var search = ""
-    @State private var selectedFileID: UUID?
+    @State private var selectedFileID: String?
+
+    @State private var diffLines: [DiffLine] = []
+    @State private var isLoadingDiff = false
+    @State private var diffTask: Task<Void, Never>?
 
     @State private var showCommit = false
     @State private var showCheckout = false
     @State private var showRevertConfirm = false
-    @State private var showUpdate = false
     @State private var toast: String?
     @State private var draftMessage = ""
+    @State private var recentMessages: [String] = []
     @State private var isRefreshing = false
     @State private var appError: String?
+    @StateObject private var operation = OperationController()
     @AppStorage("backupBeforeRevert") private var backupBeforeRevert = true
 
-    private var activeWC: WorkingCopy {
-        workingCopies.first { $0.id == selectedWCID } ?? workingCopies[0]
+    private var activeWC: WorkingCopy? {
+        workingCopies.first { $0.path == selectedWCID } ?? workingCopies.first
     }
 
     private var visibleFiles: [FileItem] {
@@ -66,62 +75,57 @@ struct ContentView: View {
     }
 
     private var focusedFile: FileItem? {
-        files.first { $0.id == selectedFileID } ?? visibleFiles.first
+        if let selectedFileID, let item = files.first(where: { $0.id == selectedFileID }) {
+            return item
+        }
+        return visibleFiles.first
     }
 
     private func count(of status: FileStatus) -> Int {
         files.filter { $0.status == status }.count
     }
 
-    private func checkBinding(for item: FileItem) -> Binding<Bool> {
-        Binding(
-            get: { files.first { $0.id == item.id }?.isChecked ?? false },
-            set: { value in
-                if let idx = files.firstIndex(where: { $0.id == item.id }) {
-                    files[idx].isChecked = value
-                }
-            }
-        )
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             topBar
             hr
-            HSplitView {
-                sidebarPanel
-                    .frame(minWidth: 160, idealWidth: 210, maxWidth: 320)
-                changesPanel
-                    .frame(minWidth: 240, idealWidth: 320, maxWidth: 460)
-                diffPanel
-                    .frame(minWidth: 280, maxWidth: .infinity)
+            Group {
+                if workingCopies.isEmpty {
+                    WelcomeView(
+                        onAdd: { addExistingWorkingCopy() },
+                        onCheckout: { showCheckout = true }
+                    )
+                } else {
+                    HSplitView {
+                        sidebarPanel
+                            .frame(minWidth: 160, idealWidth: 210, maxWidth: 320)
+                        changesPanel
+                            .frame(minWidth: 240, idealWidth: 320, maxWidth: 460)
+                        diffPanel
+                            .frame(minWidth: 280, maxWidth: .infinity)
+                    }
+                }
             }
-            hr
-            commitBar
+            if activeWC != nil {
+                hr
+                commitBar
+            }
         }
         .background(ForkTheme.bg)
         .sheet(isPresented: $showCommit) {
-            CommitSheet(wc: activeWC, files: $files, draftMessage: $draftMessage) { count in
-                showToast("Committed \(count) file(s) at r\(activeWC.revision + 1)")
-                bumpRevision()
-                let conflicts = files.filter { $0.status == .conflicted }.count
-                if conflicts > 0 {
-                    showError("svn: E155015: commit partially succeeded - \(conflicts) conflicted file(s) were skipped. Resolve conflicts before the next commit.")
+            if let wc = activeWC {
+                CommitSheet(wc: wc, files: $files, recentMessages: recentMessages) { items, message, keepLocks in
+                    performCommit(items: items, message: message, keepLocks: keepLocks)
                 }
             }
         }
         .sheet(isPresented: $showCheckout) {
-            CheckoutSheet { wc in
-                workingCopies.append(wc)
-                selectedWCID = wc.id
-                showToast("Checked out \(wc.name) at r\(wc.revision)")
+            CheckoutSheet { url, destination, revision, depth in
+                performCheckout(url: url, destination: destination, revision: revision, depth: depth)
             }
         }
-        .sheet(isPresented: $showUpdate) {
-            UpdateProgressSheet(wc: activeWC) {
-                bumpRevision()
-                showToast("Updated \(activeWC.name) to r\(activeWC.revision + 1)")
-            }
+        .sheet(isPresented: $operation.isPresented) {
+            OperationProgressSheet(operation: operation)
         }
         .alert("Revert \(checkedFiles.count) file(s)?", isPresented: $showRevertConfirm) {
             Button("Revert", role: .destructive) { performRevert() }
@@ -142,10 +146,16 @@ struct ContentView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .onAppear {
-            if selectedWCID == nil { selectedWCID = workingCopies.first?.id }
+        .task {
+            loadRecentMessages()
+            await loadWorkingCopies()
         }
-        .onChange(of: selectedWCID) { refreshStatus() }
+        .task(id: selectedWCID) {
+            await refreshStatus()
+        }
+        .onChange(of: focusedFile?.id) { _, _ in
+            loadDiff()
+        }
         .frame(minWidth: 760, minHeight: 560)
     }
 
@@ -160,7 +170,7 @@ struct ContentView: View {
             Text("MacSVN")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(ForkTheme.textPrimary)
-            Text(activeWC.name)
+            Text(activeWC?.name ?? "No working copy")
                 .font(.system(size: 12))
                 .foregroundStyle(ForkTheme.textSecondary)
                 .lineLimit(1)
@@ -168,20 +178,22 @@ struct ContentView: View {
 
             Spacer(minLength: 8)
 
-            HStack(spacing: 6) {
-                Text(activeWC.branch)
-                    .font(.system(size: 11, weight: .medium))
-                    .lineLimit(1)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 3)
-                    .background(ForkTheme.panel, in: Capsule())
-                    .foregroundStyle(ForkTheme.textPrimary)
-                Text("r\(activeWC.revision)")
-                    .font(.system(size: 11, weight: .semibold))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 3)
-                    .background(Color.green.opacity(0.22), in: Capsule())
-                    .foregroundStyle(.green)
+            if let wc = activeWC {
+                HStack(spacing: 6) {
+                    Text(wc.branch)
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 3)
+                        .background(ForkTheme.panel, in: Capsule())
+                        .foregroundStyle(ForkTheme.textPrimary)
+                    Text("r\(wc.revision)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 3)
+                        .background(Color.green.opacity(0.22), in: Capsule())
+                        .foregroundStyle(.green)
+                }
             }
 
             Spacer(minLength: 8)
@@ -189,11 +201,12 @@ struct ContentView: View {
             toolbarIcon("square.and.arrow.down", "Checkout...") { showCheckout = true }
             toolbarIcon("arrow.uturn.backward", "Revert - discard changes...") { showRevertConfirm = true }
                 .disabled(checkedFiles.isEmpty)
-            toolbarIcon("arrow.clockwise", "Refresh status") { refreshStatus() }
+            toolbarIcon("arrow.clockwise", "Refresh status") { Task { await refreshStatus() } }
                 .keyboardShortcut("r", modifiers: .command)
+                .disabled(activeWC == nil)
 
             Button {
-                showUpdate = true
+                runUpdate()
             } label: {
                 Label("Update", systemImage: "arrow.triangle.2.circlepath")
                     .font(.system(size: 12, weight: .medium))
@@ -201,13 +214,10 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .tint(ForkTheme.buttonTint)
             .foregroundStyle(ForkTheme.textPrimary)
+            .disabled(activeWC == nil)
 
             Menu {
                 Toggle("Backup files before Revert", isOn: $backupBeforeRevert)
-                Divider()
-                Button("Preview error banner") {
-                    showError("svn: E170001: Authentication failed for 'http://svn.example.com/repos/example/ExampleApp' - check username/password and try again.")
-                }
             } label: {
                 Image(systemName: "gearshape")
                     .font(.system(size: 13, weight: .medium))
@@ -219,7 +229,7 @@ struct ContentView: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
-            .help("Settings & demo options")
+            .help("Settings")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
@@ -259,21 +269,23 @@ struct ContentView: View {
 
             hr
 
-            Button {
-                showCheckout = true
+            Menu {
+                Button("Add Existing Working Copy...") { addExistingWorkingCopy() }
+                Button("Checkout New Working Copy...") { showCheckout = true }
             } label: {
                 Label("Add working copy...", systemImage: "plus.circle")
                     .font(.system(size: 11))
                     .foregroundStyle(ForkTheme.textSecondary)
             }
-            .buttonStyle(.plain)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .padding(12)
         }
         .background(ForkTheme.sidebar)
     }
 
     private func wcRow(_ wc: WorkingCopy) -> some View {
-        let selected = wc.id == activeWC.id
+        let selected = wc.path == selectedWCID
         return HStack(spacing: 8) {
             Image(systemName: "shippingbox.fill")
                 .font(.system(size: 12))
@@ -296,7 +308,14 @@ struct ContentView: View {
         .padding(.vertical, 6)
         .background(selected ? ForkTheme.rowSelected : Color.clear, in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
-        .onTapGesture { selectedWCID = wc.id }
+        .onTapGesture { selectedWCID = wc.path }
+        .contextMenu {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: wc.path)])
+            }
+            Divider()
+            Button("Remove from List") { removeWorkingCopy(wc) }
+        }
     }
 
     private var changesPanel: some View {
@@ -447,7 +466,7 @@ struct ContentView: View {
     }
 
     private func changeRow(_ item: FileItem) -> some View {
-        let selected = item.id == (focusedFile?.id ?? UUID())
+        let selected = item.id == focusedFile?.id
         return HStack(spacing: 9) {
             Button {
                 if let idx = files.firstIndex(where: { $0.id == item.id }) {
@@ -489,7 +508,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private func rowMenu(_ item: FileItem) -> some View {
-        Button("Update") { showUpdate = true }
+        Button("Update") { runUpdate() }
         Button("Commit...") {
             if let idx = files.firstIndex(where: { $0.id == item.id }) {
                 files[idx].isChecked = true
@@ -503,24 +522,22 @@ struct ContentView: View {
             }
             showRevertConfirm = true
         }
-        Divider()
-        Menu("Ignore") {
-            Button("Ignore \"\(item.displayName)\"") { ignore(item, mode: .file) }
-            if !item.ext.isEmpty {
-                Button("Ignore all *.\(item.ext) files") { ignore(item, mode: .extension) }
-            }
-            if item.folder != "." {
-                Button("Ignore folder \"\(item.folder)\"") { ignore(item, mode: .folder) }
+        if item.status == .unversioned {
+            Divider()
+            Menu("Ignore") {
+                Button("Ignore \"\(item.displayName)\"") { ignore(item, mode: .file) }
+                if !item.ext.isEmpty {
+                    Button("Ignore all *.\(item.ext) files") { ignore(item, mode: .extension) }
+                }
+                if item.folder != "." {
+                    Button("Ignore folder \"\(item.folder)\"") { ignore(item, mode: .folder) }
+                }
             }
         }
         Divider()
         Button("Open in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([
-                URL(fileURLWithPath: activeWC.path).appendingPathComponent(item.folder)
-            ])
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.absPath)])
         }
-        Button("Diff...") {}
-            .disabled(item.status != .modified)
     }
 
     private var diffPanel: some View {
@@ -540,6 +557,10 @@ struct ContentView: View {
                         .lineLimit(1)
                         .truncationMode(.head)
                     Spacer(minLength: 8)
+                    if isLoadingDiff {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
                     if file.revision > 0 {
                         Text("base r\(file.revision)")
                             .font(.system(size: 10))
@@ -554,7 +575,7 @@ struct ContentView: View {
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(file.mockDiff) { line in
+                        ForEach(diffLines) { line in
                             diffRow(line)
                         }
                     }
@@ -620,20 +641,22 @@ struct ContentView: View {
                     Text("Message")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(ForkTheme.textSecondary)
-                    Menu {
-                        Button("Update app layout and assets") { draftMessage = "Update app layout and assets" }
-                        Button("Fix config parsing bug") { draftMessage = "Fix config parsing bug" }
-                        Button("Add new icons and docs") { draftMessage = "Add new icons and docs" }
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "clock.arrow.circlepath")
-                            Text("Recent")
+                    if !recentMessages.isEmpty {
+                        Menu {
+                            ForEach(recentMessages, id: \.self) { message in
+                                Button(message) { draftMessage = message }
+                            }
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: "clock.arrow.circlepath")
+                                Text("Recent")
+                            }
+                            .font(.system(size: 10))
+                            .foregroundStyle(ForkTheme.textSecondary)
                         }
-                        .font(.system(size: 10))
-                        .foregroundStyle(ForkTheme.textSecondary)
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
                     }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
                 }
 
                 TextEditor(text: $draftMessage)
@@ -674,40 +697,343 @@ struct ContentView: View {
         .background(ForkTheme.sidebar)
     }
 
-    private func bumpRevision() {
-        guard let idx = workingCopies.firstIndex(where: { $0.id == activeWC.id }) else { return }
-        workingCopies[idx].revision += 1
+    // MARK: - Loading
+
+    private func loadRecentMessages() {
+        recentMessages = UserDefaults.standard.stringArray(forKey: Self.recentMessagesKey) ?? []
+    }
+
+    private func recordMessage(_ message: String) {
+        var list = recentMessages.filter { $0 != message }
+        list.insert(message, at: 0)
+        recentMessages = Array(list.prefix(5))
+        UserDefaults.standard.set(recentMessages, forKey: Self.recentMessagesKey)
+    }
+
+    private func loadWorkingCopies() async {
+        let paths = UserDefaults.standard.stringArray(forKey: Self.wcPathsKey) ?? []
+        var result: [WorkingCopy] = []
+        for path in paths {
+            if let info = try? await SVN.info(at: path) {
+                result.append(WorkingCopy(info: info))
+            }
+        }
+        workingCopies = result
+        persistPaths()
+        if selectedWCID == nil || !result.contains(where: { $0.path == selectedWCID }) {
+            selectedWCID = result.first?.path
+        }
+    }
+
+    private func persistPaths() {
+        UserDefaults.standard.set(workingCopies.map(\.path), forKey: Self.wcPathsKey)
+    }
+
+    private func refreshStatus() async {
+        guard let wc = activeWC else {
+            files = []
+            diffLines = []
+            return
+        }
+        isRefreshing = true
+        defer { isRefreshing = false }
+
+        let previousChecked = Dictionary(files.map { ($0.id, $0.isChecked) }, uniquingKeysWith: { first, _ in first })
+        do {
+            let entries = try await SVN.status(in: wc.path)
+            var items: [FileItem] = []
+            for entry in entries {
+                guard var item = FileItem(entry: entry, wcPath: wc.path) else { continue }
+                if let wasChecked = previousChecked[item.id] {
+                    item.isChecked = wasChecked
+                }
+                items.append(item)
+            }
+            files = items
+        } catch {
+            files = []
+            showError(error.localizedDescription)
+        }
+        loadDiff()
+    }
+
+    private func refreshInfo() async {
+        guard let wc = activeWC, let info = try? await SVN.info(at: wc.path) else { return }
+        if let idx = workingCopies.firstIndex(where: { $0.path == wc.path }) {
+            workingCopies[idx].revision = info.revision
+            workingCopies[idx].url = info.url
+            workingCopies[idx].branch = info.branch
+            workingCopies[idx].name = info.name
+        }
+    }
+
+    private func loadDiff() {
+        diffTask?.cancel()
+        guard let wc = activeWC, let file = focusedFile else {
+            diffLines = []
+            isLoadingDiff = false
+            return
+        }
+        isLoadingDiff = true
+        diffTask = Task {
+            let lines: [DiffLine]
+            if file.status == .unversioned {
+                lines = SVN.unversionedDiff(atAbsolutePath: file.absPath)
+            } else if file.status == .missing {
+                lines = await SVN.missingFileDiff(relativePath: file.relativePath, in: wc.path)
+            } else {
+                do {
+                    let text = try await SVN.diffText(relativePath: file.relativePath, in: wc.path)
+                    lines = SVN.parseDiff(text)
+                } catch {
+                    lines = [DiffLine(kind: .note, text: "Could not load diff: \(error.localizedDescription)")]
+                }
+            }
+            guard !Task.isCancelled else { return }
+            diffLines = lines.isEmpty ? [DiffLine(kind: .note, text: "No differences.")] : lines
+            isLoadingDiff = false
+        }
+    }
+
+    // MARK: - Working copy management
+
+    private func addExistingWorkingCopy() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+        panel.message = "Choose an existing working copy folder"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        Task {
+            do {
+                let info = try await SVN.info(at: url.path)
+                if let existing = workingCopies.first(where: { $0.path == info.path }) {
+                    selectedWCID = existing.path
+                    return
+                }
+                let wc = WorkingCopy(info: info)
+                workingCopies.append(wc)
+                persistPaths()
+                selectedWCID = wc.path
+                showToast("Added \(wc.name)")
+            } catch {
+                showError("Not a working copy: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func removeWorkingCopy(_ wc: WorkingCopy) {
+        workingCopies.removeAll { $0.path == wc.path }
+        persistPaths()
+        if selectedWCID == wc.path {
+            selectedWCID = workingCopies.first?.path
+        }
+        if activeWC == nil {
+            files = []
+            diffLines = []
+        }
+    }
+
+    // MARK: - Operations
+
+    private func runUpdate() {
+        guard let wc = activeWC else { return }
+        operation.begin("Update - \(wc.name)")
+        let task = SVNTask()
+        operation.attach(task)
+        Task {
+            do {
+                let result = try await SVN.update(wcPath: wc.path, task: task) { line in
+                    Task { @MainActor in operation.append(line) }
+                }
+                operation.finish()
+                await refreshInfo()
+                await refreshStatus()
+                if result.succeeded {
+                    let revision = activeWC?.revision ?? wc.revision
+                    showToast("Updated \(wc.name) to r\(revision)")
+                } else {
+                    showError(result.errorText)
+                }
+            } catch {
+                operation.finish()
+                if !task.isCancelled { showError(error.localizedDescription) }
+            }
+        }
+    }
+
+    private func performCheckout(url: String, destination: String, revision: String?, depth: String) {
+        let name = (destination as NSString).lastPathComponent
+        operation.begin("Checkout - \(name)")
+        let task = SVNTask()
+        operation.attach(task)
+        Task {
+            do {
+                let result = try await SVN.checkout(url: url, destination: destination, revision: revision, depth: depth, task: task) { line in
+                    Task { @MainActor in operation.append(line) }
+                }
+                operation.finish()
+                if result.succeeded {
+                    if let info = try? await SVN.info(at: destination) {
+                        let wc = WorkingCopy(info: info)
+                        if !workingCopies.contains(where: { $0.path == wc.path }) {
+                            workingCopies.append(wc)
+                        }
+                        persistPaths()
+                        selectedWCID = wc.path
+                        showToast("Checked out \(wc.name) at r\(wc.revision)")
+                    } else {
+                        showToast("Checkout finished")
+                    }
+                } else {
+                    showError(result.errorText)
+                }
+            } catch {
+                operation.finish()
+                if !task.isCancelled { showError(error.localizedDescription) }
+            }
+        }
+    }
+
+    private func performCommit(items: [FileItem], message: String, keepLocks: Bool) {
+        guard let wc = activeWC else { return }
+        let unversioned = items.filter { $0.status == .unversioned }
+        let missing = items.filter { $0.status == .missing }
+        let rest = items.filter { $0.status != .unversioned && $0.status != .missing }
+        let trimmedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        operation.begin("Commit - \(wc.name)")
+        let task = SVNTask()
+        operation.attach(task)
+        Task {
+            do {
+                if !unversioned.isEmpty {
+                    operation.append("Adding \(unversioned.count) new file(s)...")
+                    _ = try await SVN.add(paths: unversioned.map(\.relativePath), wcPath: wc.path)
+                }
+                if !missing.isEmpty {
+                    operation.append("Scheduling \(missing.count) missing file(s) for deletion...")
+                    _ = try await SVN.scheduleDelete(paths: missing.map(\.relativePath), wcPath: wc.path)
+                }
+                let paths = (unversioned + missing).map(\.relativePath) + rest.map(\.relativePath)
+                let result = try await SVN.commit(paths: paths, message: trimmedMessage, keepLocks: keepLocks, wcPath: wc.path, task: task) { line in
+                    Task { @MainActor in operation.append(line) }
+                }
+                operation.finish()
+                if result.succeeded {
+                    draftMessage = trimmedMessage
+                    recordMessage(trimmedMessage)
+                    await refreshInfo()
+                    await refreshStatus()
+                    if let revision = committedRevision(from: result.stdout) {
+                        showToast("Committed r\(revision)")
+                    } else {
+                        showToast("Committed \(items.count) file(s)")
+                    }
+                } else {
+                    showError(result.errorText)
+                    await refreshStatus()
+                }
+            } catch {
+                operation.finish()
+                if !task.isCancelled { showError(error.localizedDescription) }
+                await refreshStatus()
+            }
+        }
     }
 
     private func performRevert() {
+        guard let wc = activeWC else { return }
         let checked = checkedFiles
-        for item in checked {
-            guard let idx = files.firstIndex(where: { $0.id == item.id }) else { continue }
-            if item.status == .unversioned {
-                files.remove(at: idx)
-            } else {
-                files[idx].status = .normal
-                files[idx].isChecked = false
+        guard !checked.isEmpty else { return }
+        let versioned = checked.filter { $0.status != .unversioned }
+        let unversioned = checked.filter { $0.status == .unversioned }
+
+        operation.begin("Revert \(checked.count) file(s)")
+        let task = SVNTask()
+        operation.attach(task)
+        let trashDirectory = backupBeforeRevert ? backupDirectory() : nil
+
+        Task {
+            if let trashDirectory {
+                var backedUp = 0
+                for item in checked where FileManager.default.fileExists(atPath: item.absPath) {
+                    let target = (trashDirectory as NSString).appendingPathComponent(item.relativePath)
+                    let targetDir = (target as NSString).deletingLastPathComponent
+                    try? FileManager.default.createDirectory(atPath: targetDir, withIntermediateDirectories: true)
+                    if (try? FileManager.default.copyItem(atPath: item.absPath, toPath: target)) != nil {
+                        backedUp += 1
+                    }
+                }
+                operation.append("Backed up \(backedUp) file(s) to ~/.MacSVN/trash")
+            }
+            for item in unversioned {
+                try? FileManager.default.removeItem(atPath: item.absPath)
+                operation.append("Removed unversioned '\(item.relativePath)'")
+            }
+            do {
+                if !versioned.isEmpty {
+                    let result = try await SVN.revert(paths: versioned.map(\.relativePath), wcPath: wc.path)
+                    operation.appendLines(result.stdout)
+                }
+                operation.finish()
+                await refreshInfo()
+                await refreshStatus()
+                showToast(trashDirectory != nil
+                          ? "Reverted \(checked.count) file(s) - backup saved to ~/.MacSVN/trash"
+                          : "Reverted \(checked.count) file(s)")
+            } catch {
+                operation.finish()
+                if !task.isCancelled { showError(error.localizedDescription) }
+                await refreshStatus()
             }
         }
-        showToast(backupBeforeRevert
-                  ? "Reverted \(checked.count) file(s) - backup saved to ~/.MacSVN/trash"
-                  : "Reverted \(checked.count) file(s)")
+    }
+
+    private func backupDirectory() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return NSHomeDirectory() + "/.MacSVN/trash/" + formatter.string(from: Date())
+    }
+
+    private func committedRevision(from stdout: String) -> String? {
+        guard let range = stdout.range(of: #"Committed revision (\d+)"#, options: .regularExpression) else {
+            return nil
+        }
+        return String(stdout[range]).split(separator: " ").last.map(String.init)
     }
 
     private func ignore(_ item: FileItem, mode: IgnoreMode) {
-        switch mode {
-        case .file:
-            files.removeAll { $0.id == item.id }
-            showToast("Added \"\(item.displayName)\" to ignore list")
-        case .extension:
-            files.removeAll { $0.ext == item.ext && $0.status == .unversioned }
-            showToast("Added \"*.\(item.ext)\" to ignore list")
-        case .folder:
-            files.removeAll { $0.folder.hasPrefix(item.folder) && $0.status == .unversioned }
-            showToast("Added \"\(item.folder)\" to ignore list")
+        guard let wc = activeWC else { return }
+        Task {
+            do {
+                let folderAbsolute = (wc.path as NSString).appendingPathComponent(item.folder)
+                switch mode {
+                case .file:
+                    try await SVN.addIgnore(pattern: item.displayName, toDirectory: folderAbsolute)
+                    showToast("Ignoring \"\(item.displayName)\"")
+                case .extension:
+                    try await SVN.addIgnore(pattern: "*.\(item.ext)", toDirectory: folderAbsolute)
+                    showToast("Ignoring \"*.\(item.ext)\"")
+                case .folder:
+                    let parentRelative = (item.folder as NSString).deletingLastPathComponent
+                    let parentAbsolute = parentRelative.isEmpty
+                        ? wc.path
+                        : (wc.path as NSString).appendingPathComponent(parentRelative)
+                    let folderName = (item.folder as NSString).lastPathComponent
+                    try await SVN.addIgnore(pattern: folderName, toDirectory: parentAbsolute)
+                    showToast("Ignoring folder \"\(item.folder)\"")
+                }
+                await refreshStatus()
+            } catch {
+                showError(error.localizedDescription)
+            }
         }
     }
+
+    // MARK: - UI helpers
 
     private func showToast(_ text: String) {
         withAnimation { toast = text }
@@ -722,15 +1048,6 @@ struct ContentView: View {
             if appError == message {
                 withAnimation { appError = nil }
             }
-        }
-    }
-
-    private func refreshStatus() {
-        guard !isRefreshing else { return }
-        withAnimation { isRefreshing = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            withAnimation { isRefreshing = false }
-            showToast("Status refreshed")
         }
     }
 
@@ -824,11 +1141,49 @@ struct StatusBadge: View {
     }
 }
 
+struct WelcomeView: View {
+    var onAdd: () -> Void
+    var onCheckout: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "shippingbox")
+                .font(.system(size: 44))
+                .foregroundStyle(ForkTheme.textSecondary)
+            Text("No working copies yet")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(ForkTheme.textPrimary)
+            Text("Add an existing working copy on this Mac, or check out a new one from a repository URL.")
+                .font(.system(size: 12))
+                .foregroundStyle(ForkTheme.textSecondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 380)
+            HStack(spacing: 10) {
+                Button {
+                    onAdd()
+                } label: {
+                    Label("Add Existing...", systemImage: "folder.badge.plus")
+                }
+                Button {
+                    onCheckout()
+                } label: {
+                    Label("Checkout...", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(ForkTheme.accent)
+            }
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(ForkTheme.bg)
+    }
+}
+
 struct CommitSheet: View {
     let wc: WorkingCopy
     @Binding var files: [FileItem]
-    @Binding var draftMessage: String
-    var onCommit: (Int) -> Void
+    let recentMessages: [String]
+    let onCommit: ([FileItem], String, Bool) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var message = ""
@@ -838,8 +1193,8 @@ struct CommitSheet: View {
         files.filter { $0.status.isChanged }
     }
 
-    private var checkedCount: Int {
-        files.filter { $0.isChecked && $0.status.isChanged }.count
+    private var checkedItems: [FileItem] {
+        files.filter { $0.isChecked && $0.status.isChanged }
     }
 
     private func binding(for item: FileItem) -> Binding<Bool> {
@@ -858,7 +1213,7 @@ struct CommitSheet: View {
             HStack(spacing: 8) {
                 Image(systemName: "arrow.up.circle.fill")
                     .foregroundStyle(ForkTheme.accent)
-                Text("Commit to \(activeName)")
+                Text("Commit to \(wc.name)")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(ForkTheme.textPrimary)
                 Spacer()
@@ -897,6 +1252,15 @@ struct CommitSheet: View {
                                 .foregroundStyle(ForkTheme.textSecondary)
                                 .lineLimit(1)
                             Spacer()
+                            if item.status == .unversioned {
+                                Text("will be added")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(ForkTheme.textSecondary)
+                            } else if item.status == .missing {
+                                Text("will be deleted")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(ForkTheme.textSecondary)
+                            }
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
@@ -907,9 +1271,27 @@ struct CommitSheet: View {
             .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 6))
             .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
 
-            Text("Message")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(ForkTheme.textSecondary)
+            HStack(spacing: 10) {
+                Text("Message")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(ForkTheme.textSecondary)
+                if !recentMessages.isEmpty {
+                    Menu {
+                        ForEach(recentMessages, id: \.self) { recent in
+                            Button(recent) { message = recent }
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "clock.arrow.circlepath")
+                            Text("Recent")
+                        }
+                        .font(.system(size: 10))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
+            }
 
             TextEditor(text: $message)
                 .font(.system(size: 12))
@@ -926,52 +1308,49 @@ struct CommitSheet: View {
                     .font(.system(size: 11))
                     .foregroundStyle(ForkTheme.textSecondary)
                 Spacer()
-                Text("\(checkedCount) file(s)")
+                Text("\(checkedItems.count) file(s)")
                     .font(.system(size: 11))
                     .foregroundStyle(ForkTheme.textSecondary)
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button {
-                    performCommit()
+                    onCommit(checkedItems, message, keepLocks)
+                    dismiss()
                 } label: {
                     Label("Commit", systemImage: "checkmark.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(ForkTheme.accent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || checkedCount == 0)
+                .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || checkedItems.isEmpty)
             }
         }
         .padding(18)
         .frame(width: 640)
         .background(ForkTheme.sidebar)
-        .onAppear { message = draftMessage }
-    }
-
-    private var activeName: String {
-        wc.name
-    }
-
-    private func performCommit() {
-        for idx in files.indices where files[idx].isChecked && files[idx].status.isChanged {
-            files[idx].status = .normal
-            files[idx].isChecked = false
-        }
-        draftMessage = message
-        onCommit(checkedCount)
-        dismiss()
     }
 }
 
 struct CheckoutSheet: View {
-    var onCheckout: (WorkingCopy) -> Void
+    var onCheckout: (String, String, String?, String) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var url = "http://svn.example.com/repos/demo/DemoProject"
-    @State private var destination = NSHomeDirectory() + "/Projects/"
+    @State private var url = ""
+    @State private var parentDirectory = NSHomeDirectory()
     @State private var revision = "HEAD"
-    @State private var depth = "Fully recursive"
-    @State private var name = "DemoProject"
+    @State private var depth = "infinity"
+    @State private var name = ""
+    @State private var userEditedName = false
+
+    private var destination: String {
+        (parentDirectory as NSString).appendingPathComponent(name)
+    }
+
+    private var canCheckout: Bool {
+        !url.trimmingCharacters(in: .whitespaces).isEmpty
+            && !name.trimmingCharacters(in: .whitespaces).isEmpty
+            && FileManager.default.fileExists(atPath: parentDirectory)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -986,41 +1365,56 @@ struct CheckoutSheet: View {
             Text("URL of repository")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(ForkTheme.textSecondary)
-            TextField("http://...", text: $url)
+            TextField("http://... or svn://...", text: $url)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 12, design: .monospaced))
+                .onChange(of: url) { _, newValue in
+                    if !userEditedName { deriveName(from: newValue) }
+                }
 
             Text("Checkout directory")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(ForkTheme.textSecondary)
             HStack {
-                TextField("Directory", text: $destination)
+                TextField("Parent folder", text: $parentDirectory)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12))
-                Button("Choose...") {}
+                Button("Choose...") { chooseDirectory() }
             }
+
+            Text("Folder name")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(ForkTheme.textSecondary)
+            TextField("Folder name", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12))
+                .onChange(of: name) { _, _ in userEditedName = true }
+
+            Text(destination)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(ForkTheme.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
 
             HStack(spacing: 16) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Revision")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(ForkTheme.textSecondary)
-                    Picker("", selection: $revision) {
-                        Text("HEAD revision").tag("HEAD")
-                        Text("Revision 1523").tag("1523")
-                        Text("Revision 1520").tag("1520")
-                    }
-                    .labelsHidden()
-                    .frame(width: 160)
+                    TextField("HEAD", text: $revision)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                        .frame(width: 110)
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Checkout depth")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(ForkTheme.textSecondary)
                     Picker("", selection: $depth) {
-                        Text("Fully recursive").tag("Fully recursive")
-                        Text("Immediate children").tag("Immediate children")
-                        Text("Only this item").tag("Only this item")
+                        Text("Fully recursive").tag("infinity")
+                        Text("Immediate children").tag("immediates")
+                        Text("Files only").tag("files")
+                        Text("Only this item").tag("empty")
                     }
                     .labelsHidden()
                     .frame(width: 180)
@@ -1028,99 +1422,122 @@ struct CheckoutSheet: View {
                 Spacer()
             }
 
-            Toggle("Omit externals", isOn: .constant(false))
-                .toggleStyle(.checkbox)
-                .font(.system(size: 11))
-                .foregroundStyle(ForkTheme.textSecondary)
-
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button("Checkout") {
-                    onCheckout(WorkingCopy(
-                        name: name,
-                        path: destination + name,
-                        url: url,
-                        branch: "trunk",
-                        revision: 1523
-                    ))
+                    onCheckout(
+                        url.trimmingCharacters(in: .whitespaces),
+                        destination,
+                        revision.trimmingCharacters(in: .whitespaces),
+                        depth
+                    )
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(ForkTheme.accent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(url.isEmpty || destination.isEmpty)
+                .disabled(!canCheckout)
             }
         }
         .padding(18)
         .frame(width: 620)
         .background(ForkTheme.sidebar)
     }
+
+    private func deriveName(from value: String) {
+        var cleaned = value.trimmingCharacters(in: .whitespaces)
+        while cleaned.hasSuffix("/") { cleaned.removeLast() }
+        if let last = cleaned.split(separator: "/").last {
+            name = String(last)
+        }
+    }
+
+    private func chooseDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.message = "Choose parent folder for the new working copy"
+        if panel.runModal() == .OK, let url = panel.url {
+            parentDirectory = url.path
+        }
+    }
 }
 
-struct UpdateProgressSheet: View {
-    let wc: WorkingCopy
-    var onFinish: () -> Void
-
+struct OperationProgressSheet: View {
+    @ObservedObject var operation: OperationController
     @Environment(\.dismiss) private var dismiss
-    @State private var lines: [String] = []
-    @State private var progress: Double = 0
-
-    private let steps: [(String, Double)] = [
-        ("Updating '\(Mock.workingCopies.first?.url ?? "")':", 0.1),
-        ("Updating 'Resources':", 0.25),
-        ("U  Resources/icon.png", 0.4),
-        ("U  src/Utils/StringExt.swift", 0.6),
-        ("Updating 'src':", 0.75),
-        ("G  src/Core/Engine.swift", 0.9),
-        ("Updated to revision \(1524).", 1.0),
-        ("Done.", 1.0)
-    ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .foregroundStyle(ForkTheme.accent)
-                Text("Update - \(wc.name)")
+                Text(operation.title)
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(ForkTheme.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 Spacer()
+                if operation.isRunning {
+                    ProgressView()
+                        .controlSize(.small)
+                }
             }
-            ProgressView(value: progress)
-                .tint(ForkTheme.accent)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(line.hasPrefix("U ") || line.hasPrefix("G ") ? ForkTheme.addText : ForkTheme.textSecondary)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array(operation.lines.enumerated()), id: \.offset) { index, line in
+                            Text(line.isEmpty ? " " : line)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(color(for: line))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(index)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .onChange(of: operation.lines.count) { _, count in
+                    guard count > 0 else { return }
+                    withAnimation {
+                        proxy.scrollTo(count - 1, anchor: .bottom)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(height: 150)
+            .frame(height: 220)
             .padding(8)
             .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 6))
             .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
 
             HStack {
+                if operation.isRunning {
+                    Button("Cancel") { operation.cancel() }
+                }
                 Spacer()
-                Button("Close") { dismiss() }
-                    .disabled(progress < 1.0)
+                Button("Close") { operation.isPresented = false }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operation.isRunning)
             }
         }
         .padding(18)
-        .frame(width: 560)
+        .frame(width: 640)
         .background(ForkTheme.sidebar)
-        .task {
-            for step in steps {
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                lines.append(step.0)
-                progress = step.1
-            }
-            onFinish()
+    }
+
+    private func color(for line: String) -> Color {
+        if line.hasPrefix("U ") || line.hasPrefix("A ") || line.hasPrefix("G ") {
+            return ForkTheme.addText
         }
+        if line.hasPrefix("D ") {
+            return ForkTheme.delText
+        }
+        if line.hasPrefix("C ") {
+            return .yellow
+        }
+        return ForkTheme.textSecondary
     }
 }
