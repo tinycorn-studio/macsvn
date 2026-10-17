@@ -23,7 +23,9 @@ struct SVNDemoApp: App {
     var body: some Scene {
         WindowGroup("MacSVN - SVN Manager") {
             ContentView()
-                .frame(minWidth: 1080, minHeight: 660)
+                .frame(minWidth: 760, minHeight: 560)
         }
+        .defaultSize(width: 1240, height: 780)
+        .windowResizability(.contentMinSize)
     }
 }

@@ -73,12 +73,13 @@ struct ContentView: View {
         VStack(spacing: 0) {
             topBar
             hr
-            HStack(spacing: 0) {
+            HSplitView {
                 sidebarPanel
-                hrVertical
+                    .frame(minWidth: 160, idealWidth: 210, maxWidth: 320)
                 changesPanel
-                hrVertical
+                    .frame(minWidth: 240, idealWidth: 320, maxWidth: 460)
                 diffPanel
+                    .frame(minWidth: 280, maxWidth: .infinity)
             }
             hr
             commitBar
@@ -126,15 +127,11 @@ struct ContentView: View {
         .onAppear {
             if selectedWCID == nil { selectedWCID = workingCopies.first?.id }
         }
-        .frame(minWidth: 1180, minHeight: 720)
+        .frame(minWidth: 760, minHeight: 560)
     }
 
     private var hr: some View {
         Rectangle().fill(ForkTheme.border).frame(height: 1)
-    }
-
-    private var hrVertical: some View {
-        Rectangle().fill(ForkTheme.border).frame(width: 1)
     }
 
     private var topBar: some View {
@@ -147,12 +144,15 @@ struct ContentView: View {
             Text(activeWC.name)
                 .font(.system(size: 12))
                 .foregroundStyle(ForkTheme.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
 
-            Spacer()
+            Spacer(minLength: 8)
 
             HStack(spacing: 6) {
                 Text(activeWC.branch)
                     .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
                     .padding(.horizontal, 9)
                     .padding(.vertical, 3)
                     .background(ForkTheme.panel, in: Capsule())
@@ -165,7 +165,7 @@ struct ContentView: View {
                     .foregroundStyle(.green)
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
             toolbarIcon("square.and.arrow.down", "Checkout...") { showCheckout = true }
             toolbarIcon("arrow.uturn.backward", "Revert - discard changes...") { showRevertConfirm = true }
@@ -230,7 +230,6 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .padding(12)
         }
-        .frame(width: 215)
         .background(ForkTheme.sidebar)
     }
 
@@ -244,11 +243,15 @@ struct ContentView: View {
                 Text(wc.name)
                     .font(.system(size: 12, weight: selected ? .semibold : .regular))
                     .foregroundStyle(selected ? .white : ForkTheme.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 Text("\(wc.branch) - r\(wc.revision)")
                     .font(.system(size: 10))
                     .foregroundStyle(selected ? Color.white.opacity(0.75) : ForkTheme.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
-            Spacer()
+            Spacer(minLength: 4)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -323,15 +326,19 @@ struct ContentView: View {
                         files[i].isChecked = true
                     }
                 }
+                .fixedSize()
                 Button("Uncheck all") {
                     for i in files.indices {
                         files[i].isChecked = false
                     }
                 }
-                Spacer()
+                .fixedSize()
+                Spacer(minLength: 4)
                 Text(summaryText)
                     .font(.system(size: 10))
                     .foregroundStyle(ForkTheme.textSecondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
             }
             .buttonStyle(.plain)
             .font(.system(size: 11))
@@ -339,7 +346,6 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
         }
-        .frame(width: 330)
         .background(ForkTheme.panel)
     }
 
@@ -387,6 +393,7 @@ struct ContentView: View {
                     .font(.system(size: 12))
                     .foregroundStyle(ForkTheme.textPrimary)
                     .lineLimit(1)
+                    .truncationMode(.middle)
                 Text(item.folder)
                     .font(.system(size: 10))
                     .foregroundStyle(ForkTheme.textSecondary)
@@ -447,14 +454,20 @@ struct ContentView: View {
                     Text(file.displayName)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(ForkTheme.textPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .layoutPriority(1)
                     Text(file.folder)
                         .font(.system(size: 11))
                         .foregroundStyle(ForkTheme.textSecondary)
-                    Spacer()
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                    Spacer(minLength: 8)
                     if file.revision > 0 {
                         Text("base r\(file.revision)")
                             .font(.system(size: 10))
                             .foregroundStyle(ForkTheme.textSecondary)
+                            .fixedSize()
                     }
                 }
                 .padding(.horizontal, 12)
@@ -555,6 +568,7 @@ struct ContentView: View {
                     .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 6))
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             VStack(alignment: .trailing, spacing: 6) {
                 Button {
