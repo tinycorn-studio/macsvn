@@ -8,6 +8,14 @@ macOS native SVN client với giao diện kiểu Fork — thay thế nhẹ nhàn
 
 ---
 
+## Tải về & cài đặt
+
+Tải bản mới nhất tại trang **[Releases](https://github.com/tinycorn-studio/macsvn/releases)** (mỗi version có file `MacSVN-x.y.z.dmg` + ghi chú thay đổi).
+
+1. Mở file `.dmg`, kéo **MacSVN** vào `Applications`.
+2. Lần đầu mở: chuột phải vào app → **Open** (app chưa ký, bỏ qua Gatekeeper).
+3. Cần svn CLI trên máy (xem mục Yêu cầu).
+
 ## Yêu cầu
 
 | Thành phần | Ghi chú |
@@ -27,6 +35,25 @@ swift run SVNDemo          # chạy trực tiếp từ source
 ```
 
 Sửa số version trong `make-app.sh` (biến `VERSION`) trước khi phát hành.
+
+### Phát hành phiên bản mới (release flow)
+
+```bash
+# 1. Bump VERSION trong make-app.sh, cập nhật CHANGELOG.md
+# 2. Build app + DMG
+./make-app.sh
+
+# 3. Commit, tag, push
+git add -A && git commit -m "vX.Y.Z: <tom tat>"
+git tag -a vX.Y.Z -m "MacSVN vX.Y.Z"
+git push origin main --tags
+
+# 4. Tạo GitHub Release kèm file cài (DMG không commit vào repo, đính vào release)
+gh release create vX.Y.Z dist/MacSVN-X.Y.Z.dmg \
+  --title "MacSVN vX.Y.Z" --notes-file RELEASE_NOTES.md
+```
+
+Sau bước này, trang **Releases** sẽ hiển thị ghi chú thay đổi + file cài cho từng version (giống Firebase, Docker...).
 
 ## CLI test harness
 
@@ -156,7 +183,7 @@ defaults write com.macsvn.app changesViewMode -string folders
 
 ## Lịch sử phiên bản
 
-- **0.4.0 (đang phát triển — branch `feature/svn-core`)**: tích hợp SVN thật qua SVNCore; diff preview có cache/prefetch; folder view; Update từng folder/file; tab History (log -v + diff theo revision).
+- **0.4.0** (18/10/2026): tích hợp SVN thật qua SVNCore; diff preview có cache/prefetch; folder view; Update từng folder/file; tab History (log -v + diff theo revision). [Chi tiết](CHANGELOG.md)
 - **0.3.0**: UX quick wins — empty/loading states, error banner, keyboard navigation, light/dark theme, revert backup vào trash.
 - **0.2.0**: demo UI + responsive layout.
 - **0.1.0**: khung ứng dụng ban đầu.
