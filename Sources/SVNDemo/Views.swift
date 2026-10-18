@@ -43,6 +43,19 @@ struct ContentView: View {
     @AppStorage("changesViewMode") private var changeViewMode: ChangeViewMode = .files
     @State private var openedFolder: String?
 
+    @State private var activeTab: MainTab = .changes
+    @State private var logEntries: [LogEntry] = []
+    @State private var isLoadingLog = false
+    @State private var logTask: Task<Void, Never>?
+    @State private var logLimit = 100
+    @State private var logSearch = ""
+    @State private var selectedRevision: Int?
+    @State private var historyScope: String?
+    @State private var revisionSelectedPath: LogPath?
+    @State private var revisionDiffRows: [DiffDisplayLine] = []
+    @State private var isLoadingRevisionDiff = false
+    @State private var revisionDiffTask: Task<Void, Never>?
+
     @State private var diffLines: [DiffLine] = []
     @State private var diffRows: [DiffDisplayLine] = []
     @State private var isLoadingDiff = false
@@ -138,14 +151,21 @@ struct ContentView: View {
                     HSplitView {
                         sidebarPanel
                             .frame(minWidth: 160, idealWidth: 210, maxWidth: 320)
-                        changesPanel
-                            .frame(minWidth: 240, idealWidth: 320, maxWidth: 460)
-                        diffPanel
-                            .frame(minWidth: 280, maxWidth: .infinity)
+                        if activeTab == .changes {
+                            changesPanel
+                                .frame(minWidth: 240, idealWidth: 320, maxWidth: 460)
+                            diffPanel
+                                .frame(minWidth: 280, maxWidth: .infinity)
+                        } else {
+                            historyPanel
+                                .frame(minWidth: 240, idealWidth: 320, maxWidth: 460)
+                            revisionDetailPanel
+                                .frame(minWidth: 280, maxWidth: .infinity)
+                        }
                     }
                 }
             }
-            if activeWC != nil {
+            if activeWC != nil && activeTab == .changes {
                 hr
                 commitBar
             }
@@ -191,7 +211,16 @@ struct ContentView: View {
         }
         .task(id: selectedWCID) {
             openedFolder = nil
+            resetHistory()
             await refreshStatus()
+            if activeTab == .history {
+                reloadLog()
+            }
+        }
+        .task(id: activeTab) {
+            if activeTab == .history && logEntries.isEmpty && !isLoadingLog {
+                reloadLog()
+            }
         }
         .onChange(of: focusedFile?.id) { _, _ in
             loadDiff()
@@ -215,6 +244,8 @@ struct ContentView: View {
                 .foregroundStyle(ForkTheme.textSecondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+
+            tabSwitcher
 
             Spacer(minLength: 8)
 
@@ -241,9 +272,15 @@ struct ContentView: View {
             toolbarIcon("square.and.arrow.down", "Checkout...") { showCheckout = true }
             toolbarIcon("arrow.uturn.backward", "Revert - discard changes...") { showRevertConfirm = true }
                 .disabled(checkedFiles.isEmpty)
-            toolbarIcon("arrow.clockwise", "Refresh status") { Task { await refreshStatus() } }
-                .keyboardShortcut("r", modifiers: .command)
-                .disabled(activeWC == nil)
+            toolbarIcon("arrow.clockwise", "Refresh status") {
+                if activeTab == .history {
+                    reloadLog()
+                } else {
+                    Task { await refreshStatus() }
+                }
+            }
+            .keyboardShortcut("r", modifiers: .command)
+            .disabled(activeWC == nil)
 
             HStack(spacing: 0) {
                 Button {
@@ -315,6 +352,37 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .help(help)
+    }
+
+    private var tabSwitcher: some View {
+        HStack(spacing: 2) {
+            tabSegment(.changes, symbol: "list.bullet", title: "Changes")
+            tabSegment(.history, symbol: "clock.arrow.circlepath", title: "History")
+        }
+        .padding(2)
+        .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(ForkTheme.border))
+    }
+
+    private func tabSegment(_ tab: MainTab, symbol: String, title: String) -> some View {
+        let active = activeTab == tab
+        return Button {
+            activeTab = tab
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: symbol)
+                    .font(.system(size: 10, weight: .medium))
+                Text(title)
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .foregroundStyle(active ? .white : ForkTheme.textSecondary)
+            .padding(.horizontal, 7)
+            .frame(height: 20)
+            .background(active ? ForkTheme.accent : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(tab == .changes ? "Working copy changes" : "Commit history (svn log)")
     }
 
     private var sidebarPanel: some View {
@@ -685,6 +753,7 @@ struct ContentView: View {
             Button("Update Folder \"\(group.label)\"") {
                 runUpdate(relativePaths: [group.key], label: group.label)
             }
+            Button("Show History") { showHistory(for: group.key) }
         }
         Divider()
         Button("Check all") { setGroup(group, checked: true) }
@@ -813,6 +882,7 @@ struct ContentView: View {
             }
         }
         Divider()
+        Button("Show History") { showHistory(for: item.relativePath) }
         Button("Open in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.absPath)])
         }
@@ -1040,6 +1110,466 @@ struct ContentView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(ForkTheme.sidebar)
+    }
+
+    // MARK: - History
+
+    private var filteredLog: [LogEntry] {
+        guard !logSearch.isEmpty else { return logEntries }
+        return logEntries.filter { entry in
+            entry.message.localizedCaseInsensitiveContains(logSearch)
+                || entry.author.localizedCaseInsensitiveContains(logSearch)
+                || "r\(entry.revision)".localizedCaseInsensitiveContains(logSearch)
+        }
+    }
+
+    private var selectedLogEntry: LogEntry? {
+        guard let selectedRevision else { return nil }
+        return logEntries.first { $0.revision == selectedRevision }
+    }
+
+    private var historyPanel: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text("History")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(ForkTheme.textPrimary)
+                Text("\(logEntries.count)")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(ForkTheme.accent)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(ForkTheme.accent.opacity(0.16), in: Capsule())
+                Spacer(minLength: 4)
+                if let scope = historyScope {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.text")
+                        Text((scope as NSString).lastPathComponent)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button {
+                            historyScope = nil
+                            selectedRevision = nil
+                            reloadLog()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8, weight: .bold))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textPrimary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(ForkTheme.panel, in: Capsule())
+                    .overlay(Capsule().stroke(ForkTheme.border))
+                    .help("Showing history for \"\(scope)\". Click the x to show the whole working copy.")
+                } else {
+                    HStack(spacing: 4) {
+                        Image(systemName: "shippingbox")
+                        Text("Working copy")
+                    }
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textSecondary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textSecondary)
+                TextField("Filter log", text: $logSearch)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(ForkTheme.textPrimary)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
+            .padding(.horizontal, 10)
+            .padding(.bottom, 8)
+
+            if let appError {
+                errorBanner(appError)
+            }
+
+            hr
+
+            ZStack {
+                if isLoadingLog && logEntries.isEmpty {
+                    VStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading log...")
+                            .font(.system(size: 11))
+                            .foregroundStyle(ForkTheme.textSecondary)
+                    }
+                } else if filteredLog.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 26))
+                            .foregroundStyle(ForkTheme.textSecondary)
+                        Text(logEntries.isEmpty ? "No history found" : "No revisions match the filter")
+                            .font(.system(size: 12))
+                            .foregroundStyle(ForkTheme.textSecondary)
+                    }
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(filteredLog) { entry in
+                                revisionRow(entry)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+
+            hr
+
+            HStack(spacing: 8) {
+                Button("Load 100 more...") {
+                    logLimit += 100
+                    reloadLog()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11))
+                .foregroundStyle(ForkTheme.accent)
+                .disabled(isLoadingLog)
+                .opacity(isLoadingLog ? 0.5 : 1)
+                Spacer(minLength: 4)
+                if isLoadingLog {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Text("\(logEntries.count) revisions")
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textSecondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+        }
+        .background(ForkTheme.panel)
+    }
+
+    private func revisionRow(_ entry: LogEntry) -> some View {
+        let selected = entry.revision == selectedRevision
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text("r\(entry.revision)")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(ForkTheme.accent)
+                Text(entry.author)
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textSecondary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text(entry.dateText)
+                    .font(.system(size: 10))
+                    .foregroundStyle(ForkTheme.textSecondary)
+            }
+            Text(entry.shortMessage)
+                .font(.system(size: 11))
+                .foregroundStyle(ForkTheme.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Text("\(entry.paths.count) path\(entry.paths.count == 1 ? "" : "s") changed")
+                .font(.system(size: 9))
+                .foregroundStyle(ForkTheme.textSecondary.opacity(0.85))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(selected ? ForkTheme.rowSelected.opacity(0.45) : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture { selectRevision(entry) }
+        .contextMenu {
+            Button("Copy Revision Number") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("r\(entry.revision)", forType: .string)
+            }
+            if !entry.message.isEmpty {
+                Button("Copy Message") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(entry.message, forType: .string)
+                }
+            }
+        }
+    }
+
+    private var revisionDetailPanel: some View {
+        VStack(spacing: 0) {
+            if let entry = selectedLogEntry {
+                HStack(spacing: 8) {
+                    Text("r\(entry.revision)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 3)
+                        .background(Color.green.opacity(0.22), in: Capsule())
+                        .foregroundStyle(.green)
+                    Text(entry.author)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(ForkTheme.textPrimary)
+                    Text(entry.dateText)
+                        .font(.system(size: 11))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    Spacer(minLength: 8)
+                    Text("\(entry.paths.count) changed path\(entry.paths.count == 1 ? "" : "s")")
+                        .font(.system(size: 10))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(entry.message, forType: .string)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 11))
+                            .foregroundStyle(ForkTheme.textPrimary)
+                            .frame(width: 24, height: 20)
+                            .background(ForkTheme.panel, in: RoundedRectangle(cornerRadius: 5))
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(ForkTheme.border))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy commit message")
+                    .disabled(entry.message.isEmpty)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+
+                hr
+
+                Text(entry.message.isEmpty ? "(no commit message)" : entry.message)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(entry.message.isEmpty ? ForkTheme.textSecondary : ForkTheme.textPrimary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(9)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(ForkTheme.panel, in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(ForkTheme.border))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+
+                HStack {
+                    Text("CHANGED PATHS")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    Spacer(minLength: 4)
+                    if !entry.paths.isEmpty {
+                        Text("click a path to view its diff")
+                            .font(.system(size: 9))
+                            .foregroundStyle(ForkTheme.textSecondary.opacity(0.8))
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
+
+                if entry.paths.isEmpty {
+                    Text("No changed paths reported")
+                        .font(.system(size: 11))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(entry.paths) { path in
+                                logPathRow(path)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .frame(maxHeight: 140)
+                }
+
+                hr
+
+                if let path = revisionSelectedPath {
+                    HStack(spacing: 8) {
+                        Text((path.displayPath as NSString).lastPathComponent)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(ForkTheme.textPrimary)
+                            .lineLimit(1)
+                        Text("@ r\(entry.revision)")
+                            .font(.system(size: 10))
+                            .foregroundStyle(ForkTheme.textSecondary)
+                            .fixedSize()
+                        Spacer(minLength: 8)
+                        if isLoadingRevisionDiff {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text("diff -c r\(entry.revision)")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(ForkTheme.textSecondary.opacity(0.8))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+
+                    hr
+
+                    if isLoadingRevisionDiff && revisionDiffRows.isEmpty {
+                        VStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Loading diff...")
+                                .font(.system(size: 11))
+                                .foregroundStyle(ForkTheme.textSecondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(revisionDiffRows) { row in
+                                    diffRow(row)
+                                }
+                            }
+                            .padding(.vertical, 6)
+                        }
+                    }
+                } else {
+                    Spacer()
+                }
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 30))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                    Text("Select a revision to view details")
+                        .font(.system(size: 12))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .background(ForkTheme.bg)
+    }
+
+    private func logPathRow(_ path: LogPath) -> some View {
+        let selected = path.id == revisionSelectedPath?.id
+        return HStack(spacing: 9) {
+            Text(path.action)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(path.color)
+                .frame(width: 15)
+            Image(systemName: path.kind == "dir" ? "folder" : "doc.text")
+                .font(.system(size: 10))
+                .foregroundStyle(ForkTheme.textSecondary)
+            Text(path.displayPath)
+                .font(.system(size: 11))
+                .foregroundStyle(ForkTheme.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(selected ? ForkTheme.rowSelected.opacity(0.45) : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture { selectRevisionPath(path) }
+    }
+
+    private func resetHistory() {
+        logTask?.cancel()
+        revisionDiffTask?.cancel()
+        logEntries = []
+        selectedRevision = nil
+        historyScope = nil
+        revisionSelectedPath = nil
+        revisionDiffRows = []
+        logLimit = 100
+        logSearch = ""
+        isLoadingLog = false
+        isLoadingRevisionDiff = false
+    }
+
+    private func reloadLog() {
+        logTask?.cancel()
+        guard let wc = activeWC else {
+            logEntries = []
+            return
+        }
+        let scope = historyScope
+        let limit = logLimit
+        isLoadingLog = true
+        logTask = Task {
+            do {
+                let entries = try await SVN.log(in: wc.path, limit: limit, relativePath: scope)
+                guard !Task.isCancelled else { return }
+                logEntries = entries.map { LogEntry(entry: $0, repoPrefix: wc.repositoryPrefix) }
+                isLoadingLog = false
+                if let selected = selectedRevision, let entry = logEntries.first(where: { $0.revision == selected }) {
+                    selectRevision(entry)
+                } else if let first = logEntries.first {
+                    selectRevision(first)
+                } else {
+                    selectedRevision = nil
+                    revisionSelectedPath = nil
+                    revisionDiffRows = []
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                isLoadingLog = false
+                showError(error.localizedDescription)
+            }
+        }
+    }
+
+    private func selectRevision(_ entry: LogEntry) {
+        selectedRevision = entry.revision
+        if let first = entry.paths.first {
+            selectRevisionPath(first)
+        } else {
+            revisionDiffTask?.cancel()
+            revisionSelectedPath = nil
+            revisionDiffRows = []
+            isLoadingRevisionDiff = false
+        }
+    }
+
+    private func selectRevisionPath(_ path: LogPath) {
+        revisionSelectedPath = path
+        revisionDiffTask?.cancel()
+        guard let wc = activeWC, let revision = selectedRevision else { return }
+        isLoadingRevisionDiff = true
+        revisionDiffRows = []
+        let relative = path.displayPath.hasSuffix("/") ? String(path.displayPath.dropLast()) : path.displayPath
+        revisionDiffTask = Task {
+            do {
+                let text: String
+                do {
+                    text = try await SVN.diffRevision(relativePath: relative, revision: revision, in: wc.path)
+                } catch {
+                    guard !wc.url.isEmpty else { throw error }
+                    let encoded = relative.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? relative
+                    text = try await SVN.diffRevision(url: wc.url + "/" + encoded, revision: revision)
+                }
+                guard !Task.isCancelled else { return }
+                let lines = SVN.parseDiff(text)
+                revisionDiffRows = DiffNumbering.build(lines.isEmpty
+                    ? [DiffLine(kind: .note, text: "No differences in this path for this revision.")]
+                    : lines)
+                isLoadingRevisionDiff = false
+            } catch {
+                guard !Task.isCancelled else { return }
+                revisionDiffRows = DiffNumbering.build([DiffLine(kind: .note, text: error.localizedDescription)])
+                isLoadingRevisionDiff = false
+            }
+        }
+    }
+
+    private func showHistory(for relativePath: String?) {
+        activeTab = .history
+        if let relativePath {
+            historyScope = relativePath
+            selectedRevision = nil
+            revisionSelectedPath = nil
+            revisionDiffRows = []
+            logLimit = 100
+        }
+        reloadLog()
     }
 
     // MARK: - Loading

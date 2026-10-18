@@ -9,6 +9,8 @@ Commands:
   info <path>               Show working copy info (read-only)
   status <wc-path>          List changed files (read-only)
   diff <wc-path> <file>     Show diff of a file relative to WC root (read-only)
+  log <wc-path> [limit]     Show recent commits with changed paths (read-only)
+  rdiff <wc-path> <rev> <path>  Diff of a path in a revision (read-only)
   ignore <dir> <pattern>    Add pattern to svn:ignore of a versioned directory
 """
 
@@ -73,6 +75,43 @@ case "diff":
     guard arguments.count >= 4 else { fail("Missing <wc-path> <file>") }
     do {
         let text = try await SVN.diffText(relativePath: arguments[3], in: arguments[2])
+        let lines = SVN.parseDiff(text)
+        if lines.isEmpty { print("(no diff)") }
+        for line in lines {
+            switch line.kind {
+            case .add: print("+ \(line.text)")
+            case .remove: print("- \(line.text)")
+            case .context: print("  \(line.text)")
+            case .hunk: print(line.text)
+            case .note: print("! \(line.text)")
+            }
+        }
+    } catch {
+        fail("error: \(error.localizedDescription)")
+    }
+
+case "log":
+    guard arguments.count >= 3 else { fail("Missing <wc-path>") }
+    let limit = arguments.count >= 4 ? (Int(arguments[3]) ?? 10) : 10
+    do {
+        let entries = try await SVN.log(in: arguments[2], limit: limit)
+        for entry in entries {
+            print("r\(entry.revision)  \(entry.author.isEmpty ? "-" : entry.author)  \(entry.date.map(String.init(describing:)) ?? "")")
+            print(entry.message.isEmpty ? "  (no message)" : entry.message.split(separator: "\n").map { "  \($0)" }.joined(separator: "\n"))
+            for path in entry.paths {
+                print("  \(path.action)  \(path.path)\(path.kind == "dir" ? "/" : "")")
+            }
+        }
+        print("(\(entries.count) entries)")
+    } catch {
+        fail("error: \(error.localizedDescription)")
+    }
+
+case "rdiff":
+    guard arguments.count >= 5 else { fail("Missing <wc-path> <revision> <path>") }
+    guard let revision = Int(arguments[3]) else { fail("Invalid <revision>") }
+    do {
+        let text = try await SVN.diffRevision(relativePath: arguments[4], revision: revision, in: arguments[2])
         let lines = SVN.parseDiff(text)
         if lines.isEmpty { print("(no diff)") }
         for line in lines {

@@ -127,6 +127,7 @@ struct WorkingCopy: Identifiable, Hashable {
     var url: String
     var branch: String
     var revision: Int
+    var repositoryPrefix: String
 
     init(info: SVNInfo) {
         self.name = info.name
@@ -134,15 +135,89 @@ struct WorkingCopy: Identifiable, Hashable {
         self.url = info.url
         self.branch = info.branch
         self.revision = info.revision
+        self.repositoryPrefix = info.repositoryPrefix
     }
 
-    init(name: String, path: String, url: String, branch: String, revision: Int) {
+    init(name: String, path: String, url: String, branch: String, revision: Int, repositoryPrefix: String = "") {
         self.name = name
         self.path = path
         self.url = url
         self.branch = branch
         self.revision = revision
+        self.repositoryPrefix = repositoryPrefix
     }
+}
+
+enum MainTab {
+    case changes
+    case history
+}
+
+struct LogPath: Identifiable {
+    let action: String
+    let kind: String
+    let displayPath: String
+
+    var id: String { "\(action)|\(displayPath)" }
+
+    init(path: SVNLogPath, repoPrefix: String) {
+        self.action = path.action
+        self.kind = path.kind
+        var display = path.path
+        if !repoPrefix.isEmpty, display.hasPrefix(repoPrefix + "/") {
+            display = String(display.dropFirst(repoPrefix.count + 1))
+        } else if display.hasPrefix("/") {
+            display = String(display.dropFirst())
+        }
+        if path.kind == "dir", !display.isEmpty, !display.hasSuffix("/") {
+            display += "/"
+        }
+        self.displayPath = display
+    }
+
+    var color: Color {
+        switch action {
+        case "A": return .green
+        case "M": return .orange
+        case "D": return .red
+        case "R": return ForkTheme.hunkText
+        default: return .gray
+        }
+    }
+}
+
+struct LogEntry: Identifiable {
+    let revision: Int
+    let author: String
+    let date: Date?
+    let message: String
+    let paths: [LogPath]
+
+    var id: Int { revision }
+
+    init(entry: SVNLogEntry, repoPrefix: String) {
+        self.revision = entry.revision
+        self.author = entry.author.isEmpty ? "-" : entry.author
+        self.date = entry.date
+        self.message = entry.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.paths = entry.paths.map { LogPath(path: $0, repoPrefix: repoPrefix) }
+    }
+
+    var shortMessage: String {
+        let first = message.split(separator: "\n").first.map(String.init) ?? ""
+        return first.isEmpty ? "(no message)" : first
+    }
+
+    var dateText: String {
+        guard let date else { return "" }
+        return LogEntry.dateFormatter.string(from: date)
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "dd/MM HH:mm"
+        return formatter
+    }()
 }
 
 struct DiffDisplayLine: Identifiable {

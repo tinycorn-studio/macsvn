@@ -118,6 +118,15 @@ public struct SVNInfo: Sendable {
         self.lastChangedDate = lastChangedDate
         self.branch = branch
     }
+
+    public var repositoryPrefix: String {
+        guard let urlComponents = URL(string: url),
+              let rootComponents = URL(string: repositoryRoot) else { return "" }
+        let urlPath = urlComponents.path
+        let rootPath = rootComponents.path
+        guard !rootPath.isEmpty, urlPath.hasPrefix(rootPath) else { return "" }
+        return String(urlPath.dropFirst(rootPath.count))
+    }
 }
 
 public struct SVNStatusEntry: Sendable {
@@ -146,6 +155,38 @@ public struct SVNStatusEntry: Sendable {
 
     public var isPropertyOnlyChange: Bool {
         item == .normal && props == "modified"
+    }
+}
+
+public struct SVNLogPath: Sendable {
+    public let action: String
+    public let kind: String
+    public let path: String
+    public let copyFromPath: String?
+    public let copyFromRevision: Int?
+
+    public init(action: String, kind: String, path: String, copyFromPath: String? = nil, copyFromRevision: Int? = nil) {
+        self.action = action
+        self.kind = kind
+        self.path = path
+        self.copyFromPath = copyFromPath
+        self.copyFromRevision = copyFromRevision
+    }
+}
+
+public struct SVNLogEntry: Sendable {
+    public let revision: Int
+    public let author: String
+    public let date: Date?
+    public let message: String
+    public let paths: [SVNLogPath]
+
+    public init(revision: Int, author: String, date: Date?, message: String, paths: [SVNLogPath]) {
+        self.revision = revision
+        self.author = author
+        self.date = date
+        self.message = message
+        self.paths = paths
     }
 }
 
@@ -576,6 +617,71 @@ public enum SVN {
             arguments.append(contentsOf: ["--revision", revision])
         }
         return try await runStreaming(arguments, task: task, onLine: onLine)
+    }
+
+    // MARK: Log
+
+    public static func log(in wcPath: String,
+                           limit: Int = 100,
+                           offset: Int? = nil,
+                           relativePath: String? = nil) async throws -> [SVNLogEntry] {
+        var arguments = ["log", "--xml", "-v", "-l", "\(limit)"]
+        if let offset {
+            arguments.append(contentsOf: ["--offset", "\(offset)"])
+        }
+        if let relativePath, !relativePath.isEmpty {
+            arguments.append(relativePath)
+        }
+        let result = try await run(arguments, workingDirectory: wcPath)
+        guard result.succeeded else { throw SVNError.failed(result) }
+        return try parseLog(result.stdout)
+    }
+
+    public static func parseLog(_ xml: String) throws -> [SVNLogEntry] {
+        guard let data = xml.data(using: .utf8), let doc = try? XMLDocument(data: data, options: []) else {
+            throw SVNError.xmlParseFailed("svn log")
+        }
+        let nodes = (try? doc.nodes(forXPath: "//logentry")) ?? []
+        var entries: [SVNLogEntry] = []
+        for node in nodes {
+            guard let element = node as? XMLElement else { continue }
+            let revision = Int(element.attribute(forName: "revision")?.stringValue ?? "") ?? 0
+            let author = element.elements(forName: "author").first?.stringValue ?? ""
+            let date = parseISODate(element.elements(forName: "date").first?.stringValue)
+            let message = element.elements(forName: "msg").first?.stringValue ?? ""
+            var paths: [SVNLogPath] = []
+            if let pathsElement = element.elements(forName: "paths").first {
+                for pathNode in pathsElement.elements(forName: "path") {
+                    let pathText = pathNode.stringValue ?? ""
+                    guard !pathText.isEmpty else { continue }
+                    paths.append(SVNLogPath(
+                        action: pathNode.attribute(forName: "action")?.stringValue ?? "M",
+                        kind: pathNode.attribute(forName: "kind")?.stringValue ?? "file",
+                        path: pathText,
+                        copyFromPath: pathNode.attribute(forName: "copyfrom-path")?.stringValue,
+                        copyFromRevision: pathNode.attribute(forName: "copyfrom-rev")?.stringValue.flatMap(Int.init)
+                    ))
+                }
+            }
+            entries.append(SVNLogEntry(revision: revision, author: author, date: date, message: message, paths: paths))
+        }
+        return entries
+    }
+
+    public static func diffRevision(relativePath: String?, revision: Int, in wcPath: String) async throws -> String {
+        var arguments = ["diff", "-c", "\(revision)", "--non-interactive"]
+        if let relativePath, !relativePath.isEmpty {
+            arguments.append(relativePath)
+        }
+        let result = try await run(arguments, workingDirectory: wcPath)
+        guard result.succeeded else { throw SVNError.failed(result) }
+        return result.stdout
+    }
+
+    public static func diffRevision(url: String, revision: Int) async throws -> String {
+        let result = try await run(["diff", "-c", "\(revision)", "--non-interactive", url])
+        guard result.succeeded else { throw SVNError.failed(result) }
+        return result.stdout
     }
 
     // MARK: Ignore
