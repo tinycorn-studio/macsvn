@@ -55,6 +55,7 @@ struct ContentView: View {
     @State private var revisionDiffRows: [DiffDisplayLine] = []
     @State private var isLoadingRevisionDiff = false
     @State private var revisionDiffTask: Task<Void, Never>?
+    @FocusState private var historyFocused: Bool
 
     @State private var diffLines: [DiffLine] = []
     @State private var diffRows: [DiffDisplayLine] = []
@@ -218,8 +219,11 @@ struct ContentView: View {
             }
         }
         .task(id: activeTab) {
-            if activeTab == .history && logEntries.isEmpty && !isLoadingLog {
-                reloadLog()
+            if activeTab == .history {
+                if logEntries.isEmpty && !isLoadingLog {
+                    reloadLog()
+                }
+                historyFocused = true
             }
         }
         .onChange(of: focusedFile?.id) { _, _ in
@@ -1217,13 +1221,34 @@ struct ContentView: View {
                             .foregroundStyle(ForkTheme.textSecondary)
                     }
                 } else {
-                    ScrollView {
-                        LazyVStack(spacing: 0) {
-                            ForEach(filteredLog) { entry in
-                                revisionRow(entry)
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                ForEach(filteredLog) { entry in
+                                    revisionRow(entry)
+                                        .id(entry.revision)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        .focusable()
+                        .focusEffectDisabled()
+                        .focused($historyFocused)
+                        .onKeyPress(.downArrow) {
+                            moveRevisionFocus(1)
+                            return .handled
+                        }
+                        .onKeyPress(.upArrow) {
+                            moveRevisionFocus(-1)
+                            return .handled
+                        }
+                        .onChange(of: selectedRevision) { _, newValue in
+                            guard let newValue else { return }
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo(newValue, anchor: .center)
                             }
                         }
-                        .padding(.vertical, 4)
+                        .help("Keys: up/down browse revisions")
                     }
                 }
             }
@@ -1257,11 +1282,21 @@ struct ContentView: View {
 
     private func revisionRow(_ entry: LogEntry) -> some View {
         let selected = entry.revision == selectedRevision
+        let isCurrent = entry.revision == activeWC?.revision
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Text("r\(entry.revision)")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundStyle(ForkTheme.accent)
+                if isCurrent {
+                    Text("current")
+                        .font(.system(size: 9, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Color.green.opacity(0.22), in: Capsule())
+                        .foregroundStyle(.green)
+                        .help("Your working copy is at this revision")
+                }
                 Text(entry.author)
                     .font(.system(size: 10))
                     .foregroundStyle(ForkTheme.textSecondary)
@@ -1315,6 +1350,15 @@ struct ContentView: View {
                     Text(entry.dateText)
                         .font(.system(size: 11))
                         .foregroundStyle(ForkTheme.textSecondary)
+                    if entry.revision == activeWC?.revision {
+                        Text("working copy base")
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.22), in: Capsule())
+                            .foregroundStyle(.green)
+                            .fixedSize()
+                    }
                     Spacer(minLength: 8)
                     Text("\(entry.paths.count) changed path\(entry.paths.count == 1 ? "" : "s")")
                         .font(.system(size: 10))
@@ -1527,6 +1571,13 @@ struct ContentView: View {
             revisionDiffRows = []
             isLoadingRevisionDiff = false
         }
+    }
+
+    private func moveRevisionFocus(_ delta: Int) {
+        guard !filteredLog.isEmpty else { return }
+        let current = filteredLog.firstIndex { $0.revision == selectedRevision } ?? -1
+        let next = max(0, min(filteredLog.count - 1, current + delta))
+        selectRevision(filteredLog[next])
     }
 
     private func selectRevisionPath(_ path: LogPath) {
