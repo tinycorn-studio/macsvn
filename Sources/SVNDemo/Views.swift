@@ -40,6 +40,8 @@ struct ContentView: View {
     @State private var filter: StatusFilter = .all
     @State private var search = ""
     @State private var selectedFileID: String?
+    @AppStorage("changesViewMode") private var changeViewMode: ChangeViewMode = .files
+    @State private var openedFolder: String?
 
     @State private var diffLines: [DiffLine] = []
     @State private var diffRows: [DiffDisplayLine] = []
@@ -77,11 +79,45 @@ struct ContentView: View {
         files.filter { $0.isChecked && $0.status.isChanged }
     }
 
+    private var isFolderListView: Bool {
+        changeViewMode == .folders && openedFolder == nil
+    }
+
+    private var isFolderDrillView: Bool {
+        changeViewMode == .folders && openedFolder != nil
+    }
+
+    private var scopedFiles: [FileItem] {
+        guard changeViewMode == .folders, let opened = openedFolder else { return visibleFiles }
+        if opened.isEmpty {
+            return visibleFiles.filter { !$0.relativePath.contains("/") }
+        }
+        return visibleFiles.filter { $0.relativePath == opened || $0.relativePath.hasPrefix(opened + "/") }
+    }
+
+    private var folderGroups: [FolderGroup] {
+        var map: [String: [FileItem]] = [:]
+        for item in visibleFiles {
+            map[topFolder(of: item), default: []].append(item)
+        }
+        let keys = map.keys.sorted { a, b in
+            if a.isEmpty != b.isEmpty { return !a.isEmpty }
+            return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
+        }
+        return keys.map { FolderGroup(key: $0, files: map[$0] ?? []) }
+    }
+
+    private func topFolder(of item: FileItem) -> String {
+        guard let index = item.relativePath.firstIndex(of: "/") else { return "" }
+        return String(item.relativePath[..<index])
+    }
+
     private var focusedFile: FileItem? {
-        if let selectedFileID, let item = files.first(where: { $0.id == selectedFileID }) {
+        if isFolderListView { return nil }
+        if let selectedFileID, let item = scopedFiles.first(where: { $0.id == selectedFileID }) {
             return item
         }
-        return visibleFiles.first
+        return scopedFiles.first
     }
 
     private func count(of status: FileStatus) -> Int {
@@ -154,6 +190,7 @@ struct ContentView: View {
             await loadWorkingCopies()
         }
         .task(id: selectedWCID) {
+            openedFolder = nil
             await refreshStatus()
         }
         .onChange(of: focusedFile?.id) { _, _ in
@@ -358,13 +395,20 @@ struct ContentView: View {
                 Text("Changes")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(ForkTheme.textPrimary)
-                Text("\(visibleFiles.count)")
+                Text("\(scopedFiles.count)")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(ForkTheme.accent)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 2)
                     .background(ForkTheme.accent.opacity(0.16), in: Capsule())
-                Spacer()
+                if isFolderListView {
+                    Text("in \(folderGroups.count) folder\(folderGroups.count == 1 ? "" : "s")")
+                        .font(.system(size: 10))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                viewModeToggle
                 Menu {
                     ForEach(StatusFilter.allCases) { f in
                         Button("\(f.rawValue) (\(filterCount(f)))") { filter = f }
@@ -403,15 +447,31 @@ struct ContentView: View {
                 errorBanner(appError)
             }
 
+            if isFolderDrillView {
+                hr
+                folderBreadcrumb
+            }
+
             hr
 
             ZStack {
                 if visibleFiles.isEmpty {
                     emptyStateView
+                } else if isFolderListView {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(folderGroups) { group in
+                                folderRow(group)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                } else if scopedFiles.isEmpty {
+                    emptyStateView
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 0) {
-                            ForEach(visibleFiles) { item in
+                            ForEach(scopedFiles) { item in
                                 changeRow(item)
                             }
                         }
@@ -452,13 +512,15 @@ struct ContentView: View {
 
             HStack(spacing: 8) {
                 Button("Check all") {
-                    for i in files.indices where files[i].status.isChanged {
+                    let ids = Set(scopedFiles.map(\.id))
+                    for i in files.indices where ids.contains(files[i].id) {
                         files[i].isChecked = true
                     }
                 }
                 .fixedSize()
                 Button("Uncheck all") {
-                    for i in files.indices {
+                    let ids = Set(scopedFiles.map(\.id))
+                    for i in files.indices where ids.contains(files[i].id) {
                         files[i].isChecked = false
                     }
                 }
@@ -491,12 +553,180 @@ struct ContentView: View {
     }
 
     private var summaryText: String {
-        let m = count(of: .modified)
-        let a = count(of: .added)
-        let u = count(of: .unversioned)
-        let x = count(of: .missing)
-        let c = count(of: .conflicted)
-        return "\(m)M \(a)A \(u)? \(x)! \(c)C"
+        StatusSummary.text(of: scopedFiles)
+    }
+
+    private var viewModeToggle: some View {
+        HStack(spacing: 2) {
+            viewModeSegment(.files, symbol: "list.bullet", title: "Files")
+            viewModeSegment(.folders, symbol: "folder", title: "Folders")
+        }
+        .padding(2)
+        .background(ForkTheme.bg, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(ForkTheme.border))
+    }
+
+    private func viewModeSegment(_ mode: ChangeViewMode, symbol: String, title: String) -> some View {
+        let active = changeViewMode == mode
+        return Button {
+            changeViewMode = mode
+            if mode == .files {
+                openedFolder = nil
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: symbol)
+                    .font(.system(size: 10, weight: .medium))
+                if active {
+                    Text(title)
+                        .font(.system(size: 10, weight: .medium))
+                }
+            }
+            .foregroundStyle(active ? .white : ForkTheme.textSecondary)
+            .padding(.horizontal, active ? 6 : 5)
+            .frame(height: 20)
+            .background(active ? ForkTheme.accent : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(mode == .files ? "View as flat file list" : "View grouped by top-level folder")
+    }
+
+    private var folderBreadcrumb: some View {
+        HStack(spacing: 6) {
+            Button {
+                openedFolder = nil
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text("Folders")
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(ForkTheme.accent)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Text("/")
+                .font(.system(size: 11))
+                .foregroundStyle(ForkTheme.textSecondary)
+            Image(systemName: "folder.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(ForkTheme.accent)
+            Text(openedFolder?.isEmpty == true ? "Root files" : (openedFolder ?? ""))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(ForkTheme.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            Text("\(scopedFiles.filter(\.isChecked).count) of \(scopedFiles.count) checked")
+                .font(.system(size: 10))
+                .foregroundStyle(ForkTheme.textSecondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+    }
+
+    private func folderRow(_ group: FolderGroup) -> some View {
+        HStack(spacing: 9) {
+            Button {
+                toggleGroup(group)
+            } label: {
+                Image(systemName: group.checkState == .on
+                      ? "checkmark.circle.fill"
+                      : group.checkState == .off ? "circle" : "minus.circle")
+                    .font(.system(size: 14))
+                    .foregroundStyle(group.checkState == .on ? ForkTheme.accent : ForkTheme.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .help("Check or uncheck all files in this folder")
+
+            Image(systemName: "folder.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(ForkTheme.accent)
+
+            Text(group.label)
+                .font(.system(size: 12))
+                .foregroundStyle(ForkTheme.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer(minLength: 4)
+
+            Text(group.summary)
+                .font(.system(size: 10))
+                .foregroundStyle(ForkTheme.textSecondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+
+            Text("\(group.count)")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(ForkTheme.accent)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(ForkTheme.accent.opacity(0.16), in: Capsule())
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(ForkTheme.textSecondary)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture { openedFolder = group.key }
+        .contextMenu { folderMenu(group) }
+    }
+
+    @ViewBuilder
+    private func folderMenu(_ group: FolderGroup) -> some View {
+        Button("Open \"\(group.label)\"") { openedFolder = group.key }
+        if !group.key.isEmpty {
+            Button("Update Folder \"\(group.label)\"") {
+                runUpdate(relativePaths: [group.key], label: group.label)
+            }
+        }
+        Divider()
+        Button("Check all") { setGroup(group, checked: true) }
+        Button("Uncheck all") { setGroup(group, checked: false) }
+        Divider()
+        Button("Commit...") {
+            setGroup(group, checked: true)
+            showCommit = true
+        }
+        Button("Revert (discard changes)...") {
+            setGroup(group, checked: true)
+            showRevertConfirm = true
+        }
+        Divider()
+        Button("Open in Finder") {
+            guard let wc = activeWC else { return }
+            let abs = group.key.isEmpty ? wc.path : (wc.path as NSString).appendingPathComponent(group.key)
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: abs)])
+        }
+    }
+
+    private func setGroup(_ group: FolderGroup, checked: Bool) {
+        let ids = Set(group.files.map(\.id))
+        for i in files.indices where ids.contains(files[i].id) {
+            files[i].isChecked = checked
+        }
+    }
+
+    private func toggleGroup(_ group: FolderGroup) {
+        setGroup(group, checked: group.checkState != .on)
+    }
+
+    private func rowSubpath(_ item: FileItem) -> String? {
+        if changeViewMode == .folders, let opened = openedFolder {
+            if opened.isEmpty { return nil }
+            if item.relativePath.hasPrefix(opened + "/") {
+                let dir = (item.relativePath as NSString).deletingLastPathComponent
+                let relative = dir == opened ? "" : String(dir.dropFirst(opened.count + 1))
+                return relative.isEmpty ? nil : relative
+            }
+        }
+        return item.folder
     }
 
     private func changeRow(_ item: FileItem) -> some View {
@@ -524,11 +754,13 @@ struct ContentView: View {
                     .foregroundStyle(ForkTheme.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(item.folder)
-                    .font(.system(size: 10))
-                    .foregroundStyle(ForkTheme.textSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.head)
+                if let subpath = rowSubpath(item) {
+                    Text(subpath)
+                        .font(.system(size: 10))
+                        .foregroundStyle(ForkTheme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
             }
             Spacer(minLength: 4)
         }
@@ -952,8 +1184,8 @@ struct ContentView: View {
 
     private func prefetchAround(_ file: FileItem) {
         guard let wc = activeWC,
-              let index = visibleFiles.firstIndex(where: { $0.id == file.id }) else { return }
-        let upcoming = Array(visibleFiles.dropFirst(index + 1).prefix(2))
+              let index = scopedFiles.firstIndex(where: { $0.id == file.id }) else { return }
+        let upcoming = Array(scopedFiles.dropFirst(index + 1).prefix(2))
         guard !upcoming.isEmpty else { return }
         prefetchTask?.cancel()
         prefetchTask = Task(priority: .utility) {
@@ -1260,10 +1492,10 @@ struct ContentView: View {
     }
 
     private func moveFocus(_ delta: Int) {
-        guard !visibleFiles.isEmpty else { return }
-        let current = visibleFiles.firstIndex { $0.id == focusedFile?.id } ?? -1
-        let next = max(0, min(visibleFiles.count - 1, current + delta))
-        selectedFileID = visibleFiles[next].id
+        guard !isFolderListView, !scopedFiles.isEmpty else { return }
+        let current = scopedFiles.firstIndex { $0.id == focusedFile?.id } ?? -1
+        let next = max(0, min(scopedFiles.count - 1, current + delta))
+        selectedFileID = scopedFiles[next].id
     }
 
     private func toggleFocused() {

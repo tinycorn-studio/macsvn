@@ -197,6 +197,56 @@ enum DiffNumbering {
     }
 }
 
+enum ChangeViewMode: String {
+    case files
+    case folders
+}
+
+enum GroupCheck {
+    case on
+    case off
+    case mixed
+}
+
+struct FolderGroup: Identifiable {
+    let key: String
+    let files: [FileItem]
+
+    var id: String { key }
+    var label: String { key.isEmpty ? "Root files" : key }
+    var count: Int { files.count }
+    var summary: String { StatusSummary.text(of: files) }
+
+    var checkState: GroupCheck {
+        let checked = files.filter(\.isChecked).count
+        if checked == 0 { return .off }
+        if checked == files.count { return .on }
+        return .mixed
+    }
+}
+
+enum StatusSummary {
+    static func counts(of files: [FileItem]) -> (modified: Int, added: Int, unversioned: Int, missing: Int, conflicted: Int) {
+        var modified = 0, added = 0, unversioned = 0, missing = 0, conflicted = 0
+        for file in files {
+            switch file.status {
+            case .modified: modified += 1
+            case .added: added += 1
+            case .unversioned: unversioned += 1
+            case .missing: missing += 1
+            case .conflicted: conflicted += 1
+            case .normal: break
+            }
+        }
+        return (modified, added, unversioned, missing, conflicted)
+    }
+
+    static func text(of files: [FileItem]) -> String {
+        let c = counts(of: files)
+        return "\(c.modified)M \(c.added)A \(c.unversioned)? \(c.missing)! \(c.conflicted)C"
+    }
+}
+
 enum StatusFilter: String, CaseIterable, Identifiable {
     case all = "All"
     case modified = "Modified"
