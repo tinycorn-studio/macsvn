@@ -208,16 +208,44 @@ struct ContentView: View {
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(activeWC == nil)
 
-            Button {
-                runUpdate()
-            } label: {
-                Label("Update", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 12, weight: .medium))
+            HStack(spacing: 0) {
+                Button {
+                    runUpdate()
+                } label: {
+                    Label("Update", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 12, weight: .medium))
+                        .padding(.leading, 10)
+                        .padding(.trailing, 6)
+                        .padding(.vertical, 5)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Update entire working copy")
+                .disabled(activeWC == nil)
+
+                Rectangle()
+                    .fill(ForkTheme.border)
+                    .frame(width: 1, height: 14)
+
+                Menu {
+                    Button("Update Entire Working Copy") { runUpdate() }
+                    Button("Update Folder...") { chooseFolderAndUpdate() }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 7)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Update options")
+                .disabled(activeWC == nil)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(ForkTheme.buttonTint)
             .foregroundStyle(ForkTheme.textPrimary)
-            .disabled(activeWC == nil)
+            .background(ForkTheme.buttonTint, in: RoundedRectangle(cornerRadius: 6))
+            .opacity(activeWC == nil ? 0.5 : 1)
 
             Menu {
                 Toggle("Backup files before Revert", isOn: $backupBeforeRevert)
@@ -313,6 +341,9 @@ struct ContentView: View {
         .contentShape(Rectangle())
         .onTapGesture { selectedWCID = wc.path }
         .contextMenu {
+            Button("Update Working Copy") { runUpdate(for: wc) }
+            Button("Update Folder...") { chooseFolderAndUpdate(for: wc) }
+            Divider()
             Button("Reveal in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: wc.path)])
             }
@@ -511,7 +542,19 @@ struct ContentView: View {
 
     @ViewBuilder
     private func rowMenu(_ item: FileItem) -> some View {
-        Button("Update") { runUpdate() }
+        Menu("Update") {
+            Button("Update \"\(item.displayName)\"") {
+                runUpdate(relativePaths: [item.relativePath], label: item.displayName)
+            }
+            if item.folder != "." {
+                Button("Update Folder \"\(item.folder)\"") {
+                    runUpdate(relativePaths: [item.folder], label: item.folder)
+                }
+            }
+            Divider()
+            Button("Update Folder...") { chooseFolderAndUpdate() }
+            Button("Update Entire Working Copy") { runUpdate() }
+        }
         Button("Commit...") {
             if let idx = files.firstIndex(where: { $0.id == item.id }) {
                 files[idx].isChecked = true
@@ -828,8 +871,9 @@ struct ContentView: View {
         loadDiff()
     }
 
-    private func refreshInfo() async {
-        guard let wc = activeWC, let info = try? await SVN.info(at: wc.path) else { return }
+    private func refreshInfo(for wcPath: String? = nil) async {
+        let target = wcPath.flatMap { path in workingCopies.first { $0.path == path } } ?? activeWC
+        guard let wc = target, let info = try? await SVN.info(at: wc.path) else { return }
         if let idx = workingCopies.firstIndex(where: { $0.path == wc.path }) {
             workingCopies[idx].revision = info.revision
             workingCopies[idx].url = info.url
@@ -967,22 +1011,26 @@ struct ContentView: View {
 
     // MARK: - Operations
 
-    private func runUpdate() {
-        guard let wc = activeWC else { return }
-        operation.begin("Update - \(wc.name)")
+    private func runUpdate(for wc: WorkingCopy? = nil, relativePaths: [String] = [], label: String? = nil) {
+        guard let wc = wc ?? activeWC else { return }
+        let target = label ?? wc.name
+        operation.begin("Update - \(target)")
         let task = SVNTask()
         operation.attach(task)
         Task {
             do {
-                let result = try await SVN.update(wcPath: wc.path, task: task) { line in
+                let result = try await SVN.update(relativePaths: relativePaths, wcPath: wc.path, task: task) { line in
                     Task { @MainActor in operation.append(line) }
                 }
                 operation.finish()
-                await refreshInfo()
+                await refreshInfo(for: wc.path)
                 await refreshStatus()
                 if result.succeeded {
-                    let revision = activeWC?.revision ?? wc.revision
-                    showToast("Updated \(wc.name) to r\(revision)")
+                    if let revision = updatedRevision(from: result.stdout) {
+                        showToast("Updated \(target) to r\(revision)")
+                    } else {
+                        showToast("Updated \(target)")
+                    }
                 } else {
                     showError(result.errorText)
                 }
@@ -991,6 +1039,37 @@ struct ContentView: View {
                 if !task.isCancelled { showError(error.localizedDescription) }
             }
         }
+    }
+
+    private func updatedRevision(from stdout: String) -> String? {
+        guard let range = stdout.range(of: #"Updated to revision (\d+)"#, options: .regularExpression) else {
+            return nil
+        }
+        return String(stdout[range]).split(separator: " ").last.map(String.init)
+    }
+
+    private func chooseFolderAndUpdate(for wc: WorkingCopy? = nil) {
+        guard let wc = wc ?? activeWC else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: wc.path)
+        panel.prompt = "Update"
+        panel.message = "Choose a folder inside \"\(wc.name)\" to update"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let wcPath = wc.path.hasSuffix("/") ? wc.path : wc.path + "/"
+        guard url.path == wc.path || url.path.hasPrefix(wcPath) else {
+            showError("Choose a folder inside \"\(wc.name)\".")
+            return
+        }
+        if url.path == wc.path {
+            runUpdate(for: wc)
+            return
+        }
+        let relative = String(url.path.dropFirst(wcPath.count))
+        runUpdate(for: wc, relativePaths: [relative], label: relative)
     }
 
     private func performCheckout(url: String, destination: String, revision: String?, depth: String) {

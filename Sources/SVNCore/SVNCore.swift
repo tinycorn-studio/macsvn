@@ -542,10 +542,13 @@ public enum SVN {
     }
 
     @discardableResult
-    public static func update(wcPath: String,
+    public static func update(relativePaths: [String] = [],
+                              wcPath: String,
                               task: SVNTask = SVNTask(),
                               onLine: @escaping (String) -> Void) async throws -> SVNResult {
-        try await runStreaming(["update", "--non-interactive"], workingDirectory: wcPath, task: task, onLine: onLine)
+        var arguments = ["update", "--non-interactive"]
+        arguments.append(contentsOf: relativePaths)
+        return try await runStreaming(arguments, workingDirectory: wcPath, task: task, onLine: onLine)
     }
 
     @discardableResult
